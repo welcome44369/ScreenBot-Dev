@@ -1,0 +1,10 @@
+{
+  "bubble_position": [
+    166,
+    194
+  ],
+  "background_opacity": 0.5,
+  "exit_hotkey": "esc",
+  "record_mouse_moves": false,
+  "record_interval_ms": 20
+}

@@ -1,0 +1,1 @@
+# ScreenBot application package
