@@ -1,8 +1,9 @@
 import time
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.observation_engine import ObservationEngine, ObservationResult
+from app.trigger_conditions import LEGACY_APPEAR, LEGACY_DISAPPEAR, label_for_code, normalize_condition
 
 
 @dataclass
@@ -13,24 +14,31 @@ class TriggerResult:
     stable_present: bool | None
     changed: bool
     observation: ObservationResult | None = None
+    condition_events: tuple = field(default_factory=tuple)
 
 
 class TextTrigger:
-    """Strict appear and conservative disappear state machine."""
+    """Observation consumer and condition state machine.
 
-    def __init__(self, target_text, event, confirm_frames=1, cooldown_ms=0,
-                 min_absent_duration_ms=5000, observation_config=None):
-        if event not in {"appear", "disappear"}:
-            raise ValueError("Text trigger event must be 'appear' or 'disappear'")
+    ObservationEngine owns OCR confidence and four-state classification.  This
+    class owns trigger semantics only, including the run-scoped state supplied
+    by WorkflowRunner for conditions that must survive a cycle restart.
+    """
+
+    def __init__(self, target_text, event=None, confirm_frames=1, cooldown_ms=0,
+                 min_absent_duration_ms=5000, observation_config=None,
+                 condition=None, condition_memory=None):
         if confirm_frames < 1 or min_absent_duration_ms < 0 or cooldown_ms < 0:
             raise ValueError("Invalid trigger confirmation settings")
         self.target_texts = [target_text] if isinstance(target_text, str) else [str(v) for v in target_text]
         self.target_text = self.target_texts[0] if self.target_texts else ""
+        self.condition, self.legacy_mode = normalize_condition(condition, event)
         self.event = event
         self.confirm_frames = confirm_frames
         self.cooldown_ms = cooldown_ms
         self.min_absent_duration_ms = min_absent_duration_ms
         self.observer = ObservationEngine(observation_config)
+        self.memory = condition_memory if condition_memory is not None else {}
         self.state = "DISARMED"
         self._present_count = 0
         self._absent_count = 0
@@ -39,6 +47,11 @@ class TextTrigger:
         self._last_trigger_wall_time = None
         self._last_observation = None
         self.has_ever_been_seen = False
+        self._pending_state = None
+        self._pending_count = 0
+        self._pending_started_at = None
+        self._pending_last_valid_at = None
+        self._condition_events = []
 
     def update(self, observation, now=None):
         if isinstance(observation, str):
@@ -47,14 +60,21 @@ class TextTrigger:
             raise TypeError("TextTrigger.update requires ObservationResult")
         now = time.monotonic() if now is None else now
         self._last_observation = observation
+        self._condition_events = []
         previous = self.state
-        if observation.state == "INVALID":
-            return self._result(False, None, previous != self.state)
-        if self.event == "appear":
-            return self._update_appear(observation, now, previous)
-        return self._update_disappear(observation, now, previous)
+        if self.legacy_mode == LEGACY_APPEAR:
+            if observation.state == "INVALID":
+                return self._result(False, None, previous != self.state)
+            return self._update_legacy_appear(observation, now, previous)
+        if self.legacy_mode == LEGACY_DISAPPEAR:
+            if observation.state == "INVALID":
+                return self._result(False, None, previous != self.state)
+            return self._update_legacy_disappear(observation, now, previous)
+        return self._update_condition(observation, now, previous)
 
-    def _update_appear(self, observation, now, previous):
+    # Exact legacy paths intentionally remain separate: existing user JSON
+    # must not acquire new edge semantics just because the new enum exists.
+    def _update_legacy_appear(self, observation, now, previous):
         if observation.state == "PRESENT" and observation.exact_match:
             self._present_count += 1
             if self._present_count >= self.confirm_frames and self.state != "TRIGGERED":
@@ -68,28 +88,18 @@ class TextTrigger:
                 self.state = "DISARMED"
         return self._result(False, None, previous != self.state)
 
-    def _update_disappear(self, observation, now, previous):
+    def _update_legacy_disappear(self, observation, now, previous):
         if observation.state == "PRESENT":
             self.has_ever_been_seen = True
             self._present_count += 1
             self._reset_absence()
-            if self._present_count >= self.confirm_frames:
-                self.state = "ARMED_PRESENT"
-            else:
-                self.state = "PRESENT_CONFIRMING"
+            self.state = "ARMED_PRESENT" if self._present_count >= self.confirm_frames else "PRESENT_CONFIRMING"
             return self._result(False, None, previous != self.state)
         if observation.state == "UNCERTAIN":
-            # A near match disproves neither presence nor disappearance, but it
-            # always breaks an in-progress missing sequence.
             self._reset_absence()
-            # Do not promote a partially confirmed presence to ARMED merely
-            # because a near match arrived.  A disappear trigger becomes
-            # armed only after the configured number of definite PRESENT
-            # observations.
             if self.state in {"ARMED_PRESENT", "ABSENT_CONFIRMING", "TRIGGERED"}:
                 self.state = "ARMED_PRESENT"
             return self._result(False, None, previous != self.state)
-        # ABSENT: only armed, valid absence contributes confirmation evidence.
         self._present_count = 0
         if self.state not in {"ARMED_PRESENT", "ABSENT_CONFIRMING", "TRIGGERED"}:
             return self._result(False, None, previous != self.state)
@@ -97,17 +107,227 @@ class TextTrigger:
             self._absent_started_at = now
         self._absent_count += 1
         self.state = "ABSENT_CONFIRMING"
-        duration_ms = self._absent_duration_ms(now)
-        if (
-            self._absent_count >= self.confirm_frames
-            and duration_ms >= self.min_absent_duration_ms
-            and not self._in_cooldown(now)
-        ):
+        if self._absent_count >= self.confirm_frames and self._absent_duration_ms(now) >= self.min_absent_duration_ms and not self._in_cooldown(now):
             self.state = "TRIGGERED"
             self._mark_trigger(now)
             self._reset_absence()
             return self._result(True, "on_text_disappear", previous != self.state)
         return self._result(False, None, previous != self.state)
+
+    def _update_condition(self, observation, now, previous):
+        # A latched state condition keeps polling for a *qualified opposite*
+        # transition.  It deliberately does not treat a permanently desired
+        # state as a failed transition attempt.
+        if self.condition["mode"] == "state" and self.memory.get("latched"):
+            return self._update_latched_state_tracking(observation, now, previous)
+        # INVALID freezes the candidate timer; UNCERTAIN breaks only the
+        # unconfirmed candidate and never changes a confirmed baseline/latch.
+        if observation.state == "INVALID":
+            self._pending_last_valid_at = None
+            return self._result(False, None, previous != self.state)
+        if observation.state == "UNCERTAIN":
+            self._reset_pending()
+            return self._result(False, None, previous != self.state)
+        confirmed = self._advance_confirmation(observation.state, now)
+        if not confirmed:
+            self.state = f"{observation.state}_CONFIRMING"
+            return self._result(False, None, previous != self.state)
+        self.state = f"CONFIRMED_{observation.state}"
+        return self._consume_confirmed_state(observation.state, now, previous)
+
+    def _update_latched_state_tracking(self, observation, now, previous):
+        desired = self.condition["desired_state"].upper()
+        opposite = "PRESENT" if desired == "ABSENT" else "ABSENT"
+        direction = f"{opposite}_TO_{desired}"
+
+        if self.memory.get("recovery_pending"):
+            return self._update_static_recovery(observation, now, previous, desired, opposite, direction)
+
+        attempt_active = bool(self.memory.get("transition_attempt_active"))
+        if not attempt_active:
+            qualified_near_match = desired == "ABSENT" and observation.state == "UNCERTAIN" and observation.reason == "near_match"
+            if observation.state == opposite or qualified_near_match:
+                self.memory["transition_attempt_active"] = True
+                self.memory["transition_candidate_state"] = opposite
+                self.memory["transition_tracking_mode"] = f"TRACK_{direction}"
+                self.memory["transition_attempt_index"] = int(self.memory.get("transition_attempt_index", 0)) + 1
+                self.memory["transition_interrupt_count"] = 0
+                self.memory["transition_result"] = "FAIL"
+                self._event("TRIGGER_TRANSITION_TRACK_STARTED", direction=direction, candidate_state=opposite, attempt_index=self.memory["transition_attempt_index"], reason="near_match" if qualified_near_match else "opposite_observation")
+                self._reset_pending()
+                if qualified_near_match:
+                    return self._result(False, None, previous != self.state)
+            else:
+                # Permanently desired observations must be inert: no attempt,
+                # no lost episode, no recovery token.
+                return self._result(False, None, previous != self.state)
+
+        if observation.state == opposite:
+            confirmed = self._advance_confirmation(opposite, now)
+            self.memory["transition_interrupt_count"] = 0
+            if confirmed:
+                self._normal_state_rearm(opposite, direction)
+            return self._result(False, None, previous != self.state)
+
+        if observation.state == desired:
+            confirmed = self._advance_confirmation(desired, now)
+            if confirmed:
+                self._record_lost(now, previous, direction, "returned_to_desired_state")
+            return self._result(False, None, previous != self.state)
+
+        # For state+absent, near_match remains positive partial PRESENT
+        # evidence.  All other UNCERTAIN and every INVALID are interruptions.
+        if observation.state == "UNCERTAIN" and desired == "ABSENT" and observation.reason == "near_match":
+            self.memory["transition_interrupt_count"] = 0
+            return self._result(False, None, previous != self.state)
+        interruptions = int(self.memory.get("transition_interrupt_count", 0)) + 1
+        self.memory["transition_interrupt_count"] = interruptions
+        if interruptions >= max(2, self.confirm_frames):
+            self._record_lost(now, previous, direction, f"interrupted_{observation.state.lower()}")
+        return self._result(False, None, previous != self.state)
+
+    def _normal_state_rearm(self, opposite, direction):
+        previous_latched = self.memory.get("latched_state")
+        self.memory.update(
+            latched=False,
+            rearm_state_seen=opposite,
+            transition_attempt_active=False,
+            transition_candidate_state=None,
+            transition_interrupt_count=0,
+            transition_result="TRUE",
+            transition_tracking_mode=f"TRACK_{direction}",
+            lost_episode_count=0,
+            recovery_pending=False,
+            recovery_token=0,
+            recovery_wait_next=False,
+        )
+        self._reset_pending()
+        self._event("TRIGGER_REARMED", confirmed_opposite_state=opposite, previous_latched_state=previous_latched)
+
+    def _record_lost(self, now, previous, direction, reason):
+        count = int(self.memory.get("lost_episode_count", 0)) + 1
+        threshold = int(self.memory.get("lost_threshold", 2))
+        self.memory.update(
+            transition_attempt_active=False,
+            transition_candidate_state=None,
+            transition_interrupt_count=0,
+            transition_result="LOST",
+            lost_episode_count=count,
+            transition_tracking_mode=f"TRACK_{direction}",
+            last_recovery_reason=reason,
+        )
+        self._reset_pending()
+        self._event("TRIGGER_TRANSITION_TRACK_LOST", direction=direction, lost_episode_count=count, lost_threshold=threshold, interrupt_reason=reason, candidate_progress=0)
+        if count >= threshold:
+            self.memory.update(recovery_pending=True, recovery_token=int(self.memory.get("recovery_token", 0)) + 1, recovery_wait_next=True)
+
+    def _update_static_recovery(self, observation, now, previous, desired, opposite, direction):
+        if self.memory.pop("recovery_wait_next", False):
+            self.memory["transition_tracking_mode"] = f"STATIC_RECOVERY_{desired}"
+            self._event("TRIGGER_STATIC_RECOVERY_STARTED", desired_state=desired, recovery_token=self.memory.get("recovery_token", 0), reason="lost_threshold_reached")
+            self._reset_pending()
+        if observation.state in {"INVALID", "UNCERTAIN"}:
+            if observation.state == "UNCERTAIN":
+                self._reset_pending()
+            return self._result(False, None, previous != self.state)
+        if observation.state == opposite:
+            self._normal_state_rearm(opposite, direction)
+            return self._result(False, None, previous != self.state)
+        if not self._advance_confirmation(desired, now):
+            return self._result(False, None, previous != self.state)
+        # Consume before returning a triggered result. Macro failure therefore
+        # cannot reopen this recovery opportunity.
+        token = int(self.memory.get("recovery_token", 0))
+        lost_before = int(self.memory.get("lost_episode_count", 0))
+        self.memory.update(recovery_token=max(0, token - 1), recovery_pending=False,
+                           lost_episode_count=0, transition_result="RECOVERED",
+                           transition_tracking_mode=f"TRACK_{direction}",
+                           recovery_generation=int(self.memory.get("recovery_generation", 0)) + 1)
+        self._reset_pending()
+        self._event("TRIGGER_STATIC_RECOVERY_MATCHED", desired_state=desired, consumed_token=token, lost_episode_count_before_reset=lost_before)
+        return self._match(now, previous, "static_recovery_match", latch=True)
+
+    def _advance_confirmation(self, state, now):
+        if self._pending_state != state:
+            self._pending_state, self._pending_count = state, 0
+            self._pending_started_at = now
+        if self._pending_last_valid_at is None:
+            # A prior INVALID is excluded from duration rather than counted.
+            self._pending_started_at = now if self._pending_count == 0 else self._pending_started_at
+        self._pending_count += 1
+        self._pending_last_valid_at = now
+        duration_ms = int((now - self._pending_started_at) * 1000) if self._pending_started_at is not None else 0
+        required_duration = self.min_absent_duration_ms if state == "ABSENT" else 0
+        return self._pending_count >= self.confirm_frames and duration_ms >= required_duration
+
+    def _consume_confirmed_state(self, state, now, previous):
+        mode, desired = self.condition["mode"], self.condition["desired_state"]
+        self.memory["last_confirmed_state"] = state
+        if mode == "initial":
+            if self.memory.get("initial_resolved"):
+                return self._result(False, None, previous != self.state)
+            matched = state.lower() == desired
+            self.memory.update(initial_resolved=True, first_confirmed_state=state, initial_matched=matched)
+            self._event("TRIGGER_INITIAL_STATE_RESOLVED", first_confirmed_state=state, matched=matched)
+            if matched:
+                return self._match(now, previous, "initial_match", latch=False)
+            return self._result(False, None, previous != self.state)
+        if mode == "edge":
+            baseline = self.memory.get("baseline_state")
+            if baseline is None:
+                self.memory["baseline_state"] = state
+                self.memory["armed"] = state.lower() != desired
+                self._event("TRIGGER_BASELINE_SET", baseline_state=state)
+                if self.memory["armed"]:
+                    self._event("TRIGGER_ARMED", armed_for=desired, reason="opposite_baseline_confirmed")
+                return self._result(False, None, previous != self.state)
+            if state != baseline:
+                self.memory["baseline_state"] = state
+                if state.lower() == desired and self.memory.get("armed"):
+                    self.memory["armed"] = False
+                    return self._match(now, previous, "transition_match", latch=False)
+                if state.lower() != desired:
+                    self.memory["armed"] = True
+                    self._event("TRIGGER_ARMED", armed_for=desired, reason="opposite_state_confirmed")
+            return self._result(False, None, previous != self.state)
+        # state mode: latch on match before cooldown decision, then require the
+        # opposite confirmed state to rearm even across a cycle restart.
+        latched = bool(self.memory.get("latched"))
+        if state.lower() == desired:
+            if latched:
+                return self._result(False, None, previous != self.state)
+            direction = "PRESENT_TO_ABSENT" if desired == "absent" else "ABSENT_TO_PRESENT"
+            self.memory.update(latched=True, latched_state=state,
+                               transition_tracking_mode=f"TRACK_{direction}",
+                               transition_direction=direction,
+                               transition_attempt_active=False,
+                               transition_result=None,
+                               lost_episode_count=0,
+                               lost_threshold=2,
+                               recovery_pending=False,
+                               recovery_token=0,
+                               recovery_wait_next=False)
+            self._event("TRIGGER_LATCHED", latched_state=state, rearm_requires="PRESENT" if desired == "absent" else "ABSENT")
+            return self._match(now, previous, "state_match", latch=True)
+        if latched:
+            self.memory["latched"] = False
+            self.memory["rearm_state_seen"] = state
+            self._event("TRIGGER_REARMED", confirmed_opposite_state=state, previous_latched_state=self.memory.get("latched_state"))
+        return self._result(False, None, previous != self.state)
+
+    def _match(self, now, previous, reason, latch):
+        self._event("TRIGGER_CONDITION_MATCHED", condition=self.condition, trigger_reason=reason)
+        if self._in_cooldown(now):
+            self._event("TRIGGER_SUPPRESSED_BY_COOLDOWN", remaining_cooldown_ms=self._cooldown_remaining(now), latched=latch)
+            return self._result(False, None, previous != self.state)
+        self._mark_trigger(now)
+        return self._result(True, f"on_text_{self.condition['mode']}_{self.condition['desired_state']}", previous != self.state)
+
+    def _event(self, name, **data):
+        self._condition_events.append({"event": name, "data": data})
+
+    def _reset_pending(self):
+        self._pending_state = self._pending_count = self._pending_started_at = self._pending_last_valid_at = None
 
     def _reset_absence(self):
         self._absent_count = 0
@@ -120,33 +340,52 @@ class TextTrigger:
         self._last_trigger_at = now
         self._last_trigger_wall_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _cooldown_remaining(self, now):
+        return max(0, self.cooldown_ms - int((now - self._last_trigger_at) * 1000)) if self._last_trigger_at else 0
+
     def _in_cooldown(self, now):
-        return self._last_trigger_at is not None and self.cooldown_ms > 0 and (now - self._last_trigger_at) * 1000 < self.cooldown_ms
+        return self._cooldown_remaining(now) > 0
 
     def _result(self, triggered, event_name, changed):
         observation = self._last_observation
-        present = observation is not None and observation.state == "PRESENT"
-        stable = True if self.state in {"ARMED_PRESENT", "TRIGGERED"} and present else (False if self.state == "ABSENT_CONFIRMING" else None)
-        return TriggerResult(triggered, event_name, present, stable, changed, observation)
+        return TriggerResult(triggered, event_name, observation is not None and observation.state == "PRESENT", None, changed, observation, tuple(self._condition_events))
 
     def get_status_snapshot(self):
         now = time.monotonic()
         observation = self._last_observation
+        code = None if self.legacy_mode else next((f"{m}_{d}" for m, d in [(self.condition['mode'], self.condition['desired_state'])]), None)
         return {
-            "stable_present": self.state == "ARMED_PRESENT",
+            "stable_present": self.memory.get("last_confirmed_state") == "PRESENT",
             "candidate_present": observation.state == "PRESENT" if observation else None,
-            "candidate_count": self._absent_count if self.state == "ABSENT_CONFIRMING" else self._present_count,
+            "candidate_count": self._pending_count or 0,
             "confirm_frames": self.confirm_frames,
-            "has_ever_been_seen": self.has_ever_been_seen,
             "last_present": observation.state == "PRESENT" if observation else None,
-            "cooldown_remaining_ms": max(0, self.cooldown_ms - int((now - self._last_trigger_at) * 1000)) if self._last_trigger_at else 0,
+            "cooldown_remaining_ms": self._cooldown_remaining(now),
             "last_trigger_time": self._last_trigger_wall_time,
             "observation": observation.as_dict() if observation else None,
             "observation_state": observation.state if observation else None,
-            "armed": self.has_ever_been_seen,
+            "armed": bool(self.memory.get("armed")),
+            "latched": bool(self.memory.get("latched")),
             "state_machine_state": self.state,
             "absent_frames": self._absent_count,
             "absent_duration_ms": self._absent_duration_ms(now),
             "required_absent_duration_ms": self.min_absent_duration_ms,
             "required_frames": self.confirm_frames,
+            "condition_mode": self.condition["mode"], "desired_state": self.condition["desired_state"],
+            "condition_label": label_for_code(self.legacy_mode or code), "legacy_mode": self.legacy_mode,
+            "first_confirmed_state": self.memory.get("first_confirmed_state"),
+            "confirmed_state": self.memory.get("last_confirmed_state"),
+            "baseline_state": self.memory.get("baseline_state"),
+            "rearm_state": self.memory.get("rearm_state_seen"),
+            "trigger_reason": self._condition_events[-1]["data"].get("trigger_reason") if self._condition_events else None,
+            "last_condition_events": list(self._condition_events),
+            "tracking_mode": self.memory.get("transition_tracking_mode"),
+            "transition_direction": self.memory.get("transition_direction"),
+            "transition_attempt_active": bool(self.memory.get("transition_attempt_active")),
+            "transition_result": self.memory.get("transition_result"),
+            "lost_episode_count": int(self.memory.get("lost_episode_count", 0)),
+            "lost_threshold": int(self.memory.get("lost_threshold", 2)),
+            "recovery_pending": bool(self.memory.get("recovery_pending")),
+            "recovery_token": int(self.memory.get("recovery_token", 0)),
+            "recovery_reason": self.memory.get("last_recovery_reason"),
         }

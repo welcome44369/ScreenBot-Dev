@@ -8,6 +8,8 @@ import os
 import re
 import threading
 import time
+import ctypes
+from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,12 +44,25 @@ class RunLogSession:
         stem = f"runtime_{started.strftime('%Y%m%d_%H%M%S')}_{workflow_name}_{self.run_id}"
         self.log_path = self.runtime_dir / f"{stem}.log"
         self.jsonl_path = self.runtime_dir / f"{stem}.jsonl"
-        self._log_handle = self.log_path.open("a", encoding="utf-8", buffering=1)
-        self._jsonl_handle = self.jsonl_path.open("a", encoding="utf-8", buffering=1)
+        self._log_handle = None
+        self._jsonl_handle = None
         self._lock = threading.RLock()
         self._sequence = 0
         self._finalized = False
-        self._write_start()
+        try:
+            self._log_handle = self.log_path.open("a", encoding="utf-8", buffering=1)
+            self._jsonl_handle = self.jsonl_path.open("a", encoding="utf-8", buffering=1)
+            self._write_start()
+        except Exception:
+            # Let WorkflowDiagnostics apply the fail-open policy, but never
+            # retain partially opened file descriptors after a failed start.
+            for handle in (self._log_handle, self._jsonl_handle):
+                if handle is not None:
+                    try:
+                        handle.close()
+                    except OSError:
+                        pass
+            raise
 
     @property
     def finalized(self) -> bool:
@@ -225,7 +240,9 @@ class RuntimeRunLogManager:
                     continue
                 metadata = first.get("data") or {}
                 pid = metadata.get("application_pid")
-                if not isinstance(pid, int) or _pid_is_alive(pid):
+                # Unknown / inaccessible owners are intentionally preserved.
+                # Only a confirmed-dead PID permits recovery of an open run.
+                if not isinstance(pid, int) or _pid_is_alive(pid) is not False:
                     continue
                 run_id = first.get("run_id")
                 sequence = int(last.get("sequence", 0) or 0) + 1
@@ -276,11 +293,45 @@ class RuntimeRunLogManager:
         return sorted(groups, key=lambda group: (group["started_at"], group["fallback_mtime"], group["run_id"]))
 
 
-def _pid_is_alive(pid: int) -> bool:
+def _pid_is_alive(pid: int) -> bool | None:
+    """Return True/False when Windows can decide; None when it cannot.
+
+    ``os.kill(pid, 0)`` is not a reliable Windows process probe and has
+    raised ``SystemError`` in the retention thread.  Process access failures
+    are deliberately fail-safe: callers must not mistake them for death.
+    """
     if pid <= 0:
         return False
+    if os.name != "nt":
+        return None
     try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        open_process.restype = wintypes.HANDLE
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_exit_code.restype = wintypes.BOOL
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = open_process(process_query_limited_information, False, pid)
+        if not handle:
+            error = ctypes.get_last_error()
+            # INVALID_PARAMETER and NOT_FOUND identify a PID that no longer
+            # exists.  ACCESS_DENIED and all unknown cases remain undecidable.
+            if error in {87, 1168}:
+                return False
+            return None
+        try:
+            exit_code = wintypes.DWORD()
+            if not get_exit_code(handle, ctypes.byref(exit_code)):
+                return None
+            return exit_code.value == still_active
+        finally:
+            close_handle(handle)
+    except (AttributeError, OSError, SystemError):
+        return None

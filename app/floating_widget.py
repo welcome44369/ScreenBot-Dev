@@ -1,5 +1,5 @@
 ﻿from pathlib import Path
-from PySide6.QtCore import Qt, QPoint, Signal, QUrl
+from PySide6.QtCore import QEvent, QTimer, Qt, QPoint, Signal, QUrl
 from PySide6.QtGui import QAction, QCursor, QColor
 from PySide6.QtWidgets import (
     QWidget,
@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QGraphicsDropShadowEffect,
 )
 from PySide6.QtGui import QDesktopServices
+from app.start_handoff import StartHandoffState
+from app.windows_no_activate import WindowsNoActivateAdapter
 
 STATE_COLORS = {
     "IDLE": "#808080",
@@ -21,6 +23,28 @@ STATE_COLORS = {
     "PAUSED": "#f08020",
     "ERROR": "#c02020",
     "RECORDING": "#c02020",
+}
+
+
+# Compact status is a presentation concern rather than an AppState.  These
+# styles deliberately use an opaque-enough foreground chip so the essential
+# status remains legible over a bright game scene even when the panel itself
+# is configured as translucent.
+COMPACT_STATUS_STYLES = {
+    "NO_TARGET": {"badge": "#64748b", "accent": "#94a3b8"},
+    "TARGET_READY": {"badge": "#0891b2", "accent": "#22d3ee"},
+    "TARGET_INVALID": {"badge": "#d97706", "accent": "#f59e0b"},
+    "STARTING": {"badge": "#2563eb", "accent": "#60a5fa"},
+    "START_ARMED": {"badge": "#ca8a04", "accent": "#facc15"},
+    "WAIT_TRIGGER": {"badge": "#d97706", "accent": "#fbbf24"},
+    "RUNNING_MACRO": {"badge": "#16a34a", "accent": "#4ade80"},
+    "STOPPING": {"badge": "#ea580c", "accent": "#fb923c"},
+    "ERROR": {"badge": "#dc2626", "accent": "#f87171"},
+    "RECORDING": {"badge": "#a855f7", "accent": "#c084fc"},
+    "COUNTDOWN": {"badge": "#ca8a04", "accent": "#facc15"},
+    "STANDALONE_RUNNING": {"badge": "#16a34a", "accent": "#4ade80"},
+    "PAUSED": {"badge": "#a16207", "accent": "#fde047"},
+    "INPUT_BLOCKED": {"badge": "#dc2626", "accent": "#fb923c"},
 }
 
 
@@ -44,19 +68,103 @@ class FloatingWidget(QWidget):
     open_macro_manager = Signal()
     open_workflow_manager = Signal()
 
-    def __init__(self, root_path):
+    def __init__(self, root_path, native_no_activate_adapter=None, overlay_diagnostics=None):
         super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowFlag(Qt.WindowDoesNotAcceptFocus)
         self.setFocusPolicy(Qt.NoFocus)
         self.root_path = Path(root_path)
+        self._overlay_diagnostics = overlay_diagnostics
+        self._native_hwnd = 0
         self.drag_position = None
         self.drag_started = False
         self.expanded = False
         self.runtime_debug_expanded = False
+        self._compact_status_view = None
+        self._native_no_activate_adapter = native_no_activate_adapter or WindowsNoActivateAdapter(
+            observer=overlay_diagnostics
+        )
         self._setup_ui()
         self.resize(420, 90)
         self._set_window_style(0.35)
+        self._observe_lifecycle("COMPACT_CONSTRUCTOR_COMPLETED")
+        QTimer.singleShot(0, self._apply_native_no_activate)
+
+    def _diagnostics_enabled(self):
+        return bool(getattr(self._overlay_diagnostics, "enabled", False))
+
+    def _observe_lifecycle(self, event, **data):
+        if self._diagnostics_enabled():
+            self._overlay_diagnostics.observe_compact_lifecycle(
+                event,
+                old_hwnd=self._native_hwnd,
+                new_hwnd=self._native_hwnd,
+                **data,
+            )
+
+    def _apply_native_no_activate(self):
+        """Reapply after Qt creates or recreates the compact root HWND."""
+        try:
+            previous_hwnd = self._native_hwnd
+            current_hwnd = int(self.winId())
+            self._native_hwnd = current_hwnd
+            if self._diagnostics_enabled():
+                lifecycle_event = (
+                    "COMPACT_WINID_FIRST_ACQUIRED"
+                    if not previous_hwnd
+                    else "COMPACT_HWND_REACQUIRED"
+                )
+                self._overlay_diagnostics.observe_compact_lifecycle(
+                    lifecycle_event,
+                    old_hwnd=previous_hwnd,
+                    new_hwnd=current_hwnd,
+                )
+                self._overlay_diagnostics.observe_compact_lifecycle(
+                    "NOACTIVATE_DEFERRED_APPLICATION",
+                    old_hwnd=current_hwnd,
+                    new_hwnd=current_hwnd,
+                )
+            return self._native_no_activate_adapter.apply(current_hwnd)
+        except (OSError, RuntimeError, TypeError):
+            return False
+
+    def has_native_no_activate(self):
+        try:
+            return self._native_no_activate_adapter.has_no_activate(int(self.winId()))
+        except (OSError, RuntimeError, TypeError):
+            return False
+
+    def showEvent(self, event):
+        self._observe_lifecycle("COMPACT_SHOW_EVENT_BEFORE")
+        super().showEvent(event)
+        self._observe_lifecycle("COMPACT_SHOW_EVENT_AFTER")
+        QTimer.singleShot(0, self._apply_native_no_activate)
+
+    def event(self, event):
+        if event.type() == QEvent.WinIdChange:
+            self._observe_lifecycle("COMPACT_WINID_CHANGE_BEFORE")
+            QTimer.singleShot(0, self._apply_native_no_activate)
+            self._observe_lifecycle("COMPACT_WINID_CHANGE_AFTER")
+        return super().event(event)
+
+    def nativeEvent(self, event_type, message):
+        diagnostic_payload = None
+        if self._diagnostics_enabled():
+            diagnostic_payload = self._overlay_diagnostics.observe_native_message(
+                event_type, message
+            )
+        result = self._native_no_activate_adapter.mouse_activate_result(message)
+        if self._diagnostics_enabled() and diagnostic_payload is not None:
+            QTimer.singleShot(
+                0,
+                lambda payload=diagnostic_payload, handler_result=result:
+                self._overlay_diagnostics.observe_native_message_after(
+                    payload, handler_result
+                ),
+            )
+        if result is not None:
+            return True, result
+        return super().nativeEvent(event_type, message)
 
     def _setup_ui(self):
         self.main_layout = QVBoxLayout(self)
@@ -243,14 +351,126 @@ class FloatingWidget(QWidget):
         self.macro_action_button.clicked.connect(lambda: self.open_macro_manager.emit())
         self.workflow_action_button.clicked.connect(lambda: self.open_workflow_manager.emit())
         self.runtime_debug_toggle.clicked.connect(self.toggle_runtime_debug)
+        if self._diagnostics_enabled():
+            self._install_diagnostic_event_filters()
+            self.start_workflow.connect(self._on_diagnostic_start_signal)
+            self.stop_workflow.connect(
+                lambda: self._overlay_diagnostics.observe_ui_event("STOP_SIGNAL_EMITTED")
+            )
+            self.refresh_workflows.connect(
+                lambda: self._overlay_diagnostics.observe_ui_event("REFRESH_SIGNAL_EMITTED")
+            )
+
+    def _install_diagnostic_event_filters(self):
+        self._diagnostic_controls = {
+            id(self.start_workflow_button): "START",
+            id(self.stop_workflow_button): "STOP_CANCEL",
+            id(self.refresh_workflow_button): "REFRESH",
+            id(self.combo): "SCRIPT_COMBO",
+            id(self.workflow_combo): "WORKFLOW_COMBO",
+            id(self.runtime_debug_toggle): "RUNTIME_DEBUG_TOGGLE",
+        }
+        for control in (
+            self.start_workflow_button,
+            self.stop_workflow_button,
+            self.refresh_workflow_button,
+            self.combo,
+            self.workflow_combo,
+            self.runtime_debug_toggle,
+        ):
+            control.installEventFilter(self)
+        self.combo.view().window().installEventFilter(self)
+        self.workflow_combo.view().window().installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if self._diagnostics_enabled():
+            control = getattr(self, "_diagnostic_controls", {}).get(id(watched))
+            if control == "START" and event.type() == QEvent.MouseButtonPress:
+                self._overlay_diagnostics.begin_interaction("START")
+                self._overlay_diagnostics.observe_ui_event(
+                    "START_UI_MOUSE_PRESS", receiver=watched.metaObject().className()
+                )
+            elif control == "START" and event.type() == QEvent.MouseButtonRelease:
+                self._overlay_diagnostics.observe_ui_event(
+                    "START_UI_MOUSE_RELEASE", receiver=watched.metaObject().className()
+                )
+            elif control == "STOP_CANCEL" and event.type() == QEvent.MouseButtonPress:
+                self._overlay_diagnostics.begin_interaction("STOP_CANCEL")
+                self._overlay_diagnostics.observe_ui_event(
+                    "STOP_CANCEL_UI_MOUSE_PRESS", receiver=watched.metaObject().className()
+                )
+            elif control == "REFRESH" and event.type() == QEvent.MouseButtonPress:
+                self._overlay_diagnostics.begin_interaction("REFRESH")
+                self._overlay_diagnostics.observe_ui_event(
+                    "REFRESH_UI_MOUSE_PRESS", receiver=watched.metaObject().className()
+                )
+            elif control in {"SCRIPT_COMBO", "WORKFLOW_COMBO"}:
+                if event.type() == QEvent.MouseButtonPress:
+                    self._overlay_diagnostics.begin_interaction(control)
+                    self._overlay_diagnostics.observe_ui_event(
+                        "COMBO_UI_MOUSE_PRESS",
+                        receiver=watched.metaObject().className(),
+                        combo=control,
+                    )
+            elif watched in {self.combo.view().window(), self.workflow_combo.view().window()}:
+                role = (
+                    "SCREENBOT_COMBO_POPUP"
+                    if watched is self.combo.view().window()
+                    else "SCREENBOT_COMBO_POPUP"
+                )
+                if event.type() == QEvent.Show:
+                    self._overlay_diagnostics.observe_popup(role, watched, "COMBO_POPUP_SHOW")
+                elif event.type() == QEvent.Hide:
+                    self._overlay_diagnostics.observe_popup(role, watched, "COMBO_POPUP_HIDE")
+        return super().eventFilter(watched, event)
+
+    def _on_diagnostic_start_signal(self):
+        if self._diagnostics_enabled():
+            self._overlay_diagnostics.observe_ui_event("START_SIGNAL_EMITTED")
+
+    def render_compact_status(self, view_model):
+        """Render the four always-visible status fields from one view model."""
+        view = dict(view_model or {})
+        visual_state = view.get("visual_state", "NO_TARGET")
+        style = COMPACT_STATUS_STYLES.get(visual_state, COMPACT_STATUS_STYLES["NO_TARGET"])
+        badge = style["badge"]
+        accent = style["accent"]
+        chip_style = (
+            "QLabel {"
+            "background: rgba(15, 23, 42, 232); color: #f8fafc; "
+            f"border: 1px solid {accent}; border-left: 4px solid {accent}; "
+            "border-radius: 6px; padding: 3px 7px;"
+            "}"
+        )
+        self.state_badge.setStyleSheet(
+            f"border-radius: 8px; background: {badge}; border: 2px solid {accent};"
+        )
+        self.status_label.setText(f"ScreenBot · {view.get('status_text') or visual_state}")
+        self.target_label.setText(view.get("target_text") or "目標：未鎖定")
+        self.state_text_label.setText(f"狀態： {view.get('status_text') or visual_state}")
+        self.event_count_label.setText(view.get("operation_text") or "請按 F8 鎖定目標視窗")
+        for label in (self.target_label, self.state_text_label, self.event_count_label):
+            label.setStyleSheet(chip_style)
+        self.target_label.setToolTip(view.get("target_full_title") or "")
+        self._compact_status_view = view
 
     def set_status(self, state, countdown_text=None):
+        """Compatibility wrapper; final compact fields still use one renderer."""
         state_name = state.name if hasattr(state, "name") else str(state)
-        color = STATE_COLORS.get(state_name, "#808080")
-        self.state_badge.setStyleSheet(f"border-radius: 8px; background: {color};")
-        countdown = f" ({countdown_text})" if countdown_text else ""
-        self.state_text_label.setText(f"狀態： {state_name}{countdown}")
-        self.status_label.setText(f"ScreenBot{countdown}")
+        visual_state = {
+            "RUNNING": "STANDALONE_RUNNING",
+            "COUNTDOWN": "COUNTDOWN",
+            "PAUSED": "PAUSED",
+            "RECORDING": "RECORDING",
+            "ERROR": "ERROR",
+        }.get(state_name, "NO_TARGET")
+        countdown = f" {countdown_text}" if countdown_text else ""
+        self.render_compact_status({
+            "visual_state": visual_state,
+            "status_text": f"{state_name}{countdown}",
+            "target_text": (self._compact_status_view or {}).get("target_text", "目標：未鎖定"),
+            "operation_text": (self._compact_status_view or {}).get("operation_text", "請按 F8 鎖定目標視窗"),
+        })
 
     def set_script_list(self, scripts):
         self.combo.blockSignals(True)
@@ -289,8 +509,10 @@ class FloatingWidget(QWidget):
 
     def set_workflow_runtime_info(self, info):
         status = info.get("status", "IDLE")
+        workflow_name = info.get("workflow_name") or "(未選擇)"
+        self.workflow_section_label.setText(f"工作流： {workflow_name}")
         self.workflow_status_label.setText(f"Workflow 狀態：{status}")
-        self.workflow_name_label.setText(f"Workflow：{info.get('workflow_name') or '(未選擇)'}")
+        self.workflow_name_label.setText(f"Workflow：{workflow_name}")
         self.workflow_step_label.setText(f"步驟：{info.get('step_number', 0)} / {info.get('total_steps', 0)}")
         self.workflow_step_id_label.setText(f"Step ID：{info.get('step_id') or '(無)'}")
         self.workflow_text_label.setText(f"監測文字：{info.get('trigger_text') or '(無)'}")
@@ -326,17 +548,43 @@ class FloatingWidget(QWidget):
         self.refresh_workflow_button.setEnabled(not running)
         self.stop_workflow_button.setEnabled(running)
 
-    def set_event_count(self, count: int):
-        if count <= 0:
-            self.event_count_label.setText("尚未錄製任何操作")
+    def set_start_handoff_presentation(self, snapshot):
+        """Render the application-owned handoff state without owning its logic."""
+        state = snapshot.state
+        if state is StartHandoffState.ARMED:
+            self.start_workflow_button.setEnabled(False)
+            self.stop_workflow_button.setEnabled(True)
+            self.stop_workflow_button.setText("取消")
+            self.workflow_status_label.setText("Workflow 狀態：等待目標前景")
+        elif state is StartHandoffState.COMMITTING:
+            self.start_workflow_button.setEnabled(False)
+            self.stop_workflow_button.setEnabled(False)
+            self.stop_workflow_button.setText("停止")
+            self.workflow_status_label.setText("Workflow 狀態：正在確認目標並啟動")
         else:
-            self.event_count_label.setText(f"目前錄製事件：{count} Events")
+            self.stop_workflow_button.setText("停止")
+
+    def set_event_count(self, count: int):
+        # Kept for external callers.  Application owns the final compact
+        # presentation and will render this value only while recording.
+        view = dict(self._compact_status_view or {})
+        view["recording_event_count"] = max(0, int(count))
+        self._compact_status_view = view
 
     def set_target_title(self, title):
-        self.target_label.setText(f"目標： {title}")
+        # Compatibility cache only.  The compact labels themselves are
+        # exclusively written by render_compact_status().
+        view = dict(self._compact_status_view or {})
+        view["target_full_title"] = title
+        self._compact_status_view = view
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            if self._diagnostics_enabled():
+                self._overlay_diagnostics.begin_interaction("COMPACT_DRAG")
+                self._overlay_diagnostics.observe_ui_event(
+                    "COMPACT_DRAG_BEGIN", receiver=self.metaObject().className()
+                )
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             self.drag_started = False
             event.accept()
@@ -355,6 +603,12 @@ class FloatingWidget(QWidget):
         if event.button() == Qt.LeftButton and self.drag_position is not None:
             if not self.drag_started:
                 self.toggle_panel()
+            if self._diagnostics_enabled():
+                self._overlay_diagnostics.observe_ui_event(
+                    "COMPACT_DRAG_END",
+                    receiver=self.metaObject().className(),
+                    dragged=self.drag_started,
+                )
             self.drag_position = None
             self.drag_started = False
             event.accept()
@@ -362,6 +616,10 @@ class FloatingWidget(QWidget):
 
     def toggle_panel(self):
         self.expanded = not self.expanded
+        if self._diagnostics_enabled():
+            self._overlay_diagnostics.observe_ui_event(
+                "COMPACT_EXPAND_TOGGLED", expanded=self.expanded
+            )
         self.details_widget.setVisible(self.expanded)
         self.setMinimumWidth(420)
         self.setMaximumHeight(16777215)
@@ -371,6 +629,11 @@ class FloatingWidget(QWidget):
 
     def toggle_runtime_debug(self):
         self.runtime_debug_expanded = not self.runtime_debug_expanded
+        if self._diagnostics_enabled():
+            self._overlay_diagnostics.observe_ui_event(
+                "COMPACT_RUNTIME_DEBUG_TOGGLED",
+                expanded=self.runtime_debug_expanded,
+            )
         for item in self._runtime_debug_widgets:
             item.setVisible(self.runtime_debug_expanded)
         self.runtime_debug_toggle.setText("▼ Runtime Debug" if self.runtime_debug_expanded else "▶ Runtime Debug")
@@ -418,7 +681,26 @@ class FloatingWidget(QWidget):
         menu = QMenu(self)
         menu.addAction(QAction("開啟腳本資料夾", self, triggered=lambda: self.open_scripts_folder.emit()))
         menu.addAction(QAction("結束應用程式", self, triggered=lambda: self.exit_requested.emit()))
+        if self._diagnostics_enabled():
+            menu.aboutToShow.connect(
+                lambda: self._overlay_diagnostics.observe_popup(
+                    "SCREENBOT_MENU_POPUP", menu, "CONTEXT_MENU_SHOW"
+                )
+            )
+            menu.aboutToHide.connect(
+                lambda: self._overlay_diagnostics.observe_popup(
+                    "SCREENBOT_MENU_POPUP", menu, "CONTEXT_MENU_HIDE"
+                )
+            )
         menu.exec(QCursor.pos())
+
+    def hideEvent(self, event):
+        self._observe_lifecycle("COMPACT_HIDE_EVENT")
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        self._observe_lifecycle("COMPACT_CLOSE_EVENT")
+        super().closeEvent(event)
 
     def _on_script_selected(self, index):
         filename = self.combo.itemData(index)

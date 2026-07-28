@@ -1,6 +1,9 @@
 ﻿import sys
 import logging
 import ctypes
+import copy
+import os
+import time
 from pathlib import Path
 from datetime import datetime
 from shutil import which
@@ -13,6 +16,8 @@ from app.logging_setup import setup_logging
 from app.settings import Settings
 from app.script_store import ScriptStore
 from app.window_tracker import WindowTracker
+from app.target_session import TargetConnectionState, TargetSessionService
+from app.input_safety import ForegroundInputSafetyGate, InputAuthorizationCode
 from app.recorder import ActionRecorder
 from app.player import ScriptPlayer
 from app.floating_widget import FloatingWidget
@@ -32,6 +37,12 @@ from app.dialog_utils import show_info, show_warning, show_error, ask_confirmati
 from app.workflow_diagnostics import WorkflowDiagnostics
 from app.workflow_editor import WorkflowEditor
 from app.workflow_debug_panel import WorkflowDebugPanel
+from app.start_handoff import (
+    StartHandoffCode,
+    StartHandoffService,
+    StartHandoffState,
+    StartRequestKind,
+)
 
 
 class RecorderOverlayBridge(QObject):
@@ -48,6 +59,9 @@ class ScreenBotApp:
         self.trigger_store = TriggerStore(self.root_path)
         self.workflow_resolver = WorkflowResolver(self.trigger_store, self.script_store)
         self.window_tracker = WindowTracker()
+        self.target_session = TargetSessionService(self.window_tracker, self.logger)
+        self.window_tracker.attach_target_session(self.target_session)
+        self.input_safety_gate = ForegroundInputSafetyGate(self.target_session, self.window_tracker, self.logger)
         self.text_detector = TextDetector(
             self.window_tracker,
             self.logger,
@@ -55,11 +69,12 @@ class ScreenBotApp:
             lang=self.settings.get("ocr_lang", "eng+chi_tra"),
         )
         self.trigger_runner = None
-        self.player = ScriptPlayer(self.window_tracker)
+        self.player = ScriptPlayer(self.window_tracker, input_safety_gate=self.input_safety_gate)
         self.player.on_error = self._handle_player_error
         self.player.on_finished = self._handle_player_finished
-        self.workflow_runner = WorkflowRunner(self.text_detector, self.script_store, self.player, logger=self.logger)
+        self.workflow_runner = WorkflowRunner(self.text_detector, self.script_store, self.player, logger=self.logger, input_safety_gate=self.input_safety_gate)
         self.workflow_diagnostics = WorkflowDiagnostics(self.root_path, self.logger)
+        self.start_handoff = StartHandoffService(timeout_seconds=15.0)
         self.workflow_data = None
         self.selected_workflow_filename = None
         self.workflow_ui_state = "IDLE"
@@ -72,7 +87,19 @@ class ScreenBotApp:
         self.app = QApplication([])
         self.app.setQuitOnLastWindowClosed(False)
 
-        self.widget = FloatingWidget(self.root_path)
+        self.overlay_diagnostics = None
+        if os.environ.get("SCREENBOT_OVERLAY_DIAGNOSTIC") == "1":
+            from app.overlay_diagnostics import OverlayDiagnostics
+
+            self.overlay_diagnostics = OverlayDiagnostics(self.root_path, self.logger)
+
+        self.widget = FloatingWidget(
+            self.root_path,
+            overlay_diagnostics=self.overlay_diagnostics,
+        )
+        if self.overlay_diagnostics is not None:
+            self.target_session.subscribe(self._on_overlay_target_session_event)
+            self.overlay_diagnostics.start()
         self.widget.script_selected.connect(self.load_script)
         self.widget.start_recording.connect(self.start_recording)
         self.widget.stop_recording.connect(self.stop_recording)
@@ -95,11 +122,13 @@ class ScreenBotApp:
         self.recorder_overlay = RecorderOverlayController(self.window_tracker, self.logger)
         self.recorder_overlay_bridge = RecorderOverlayBridge()
         self.recorder_overlay_bridge.ripple_requested.connect(self._on_overlay_ripple_requested)
+        self._recorded_event_count = 0
 
         # Recorder: create after widget so we can pass a Qt-safe callback
         def _on_event_count(count):
-            # schedule update on Qt main thread
-            QTimer.singleShot(0, lambda: self.widget.set_event_count(count))
+            # The listener thread records only the source value.  The Qt
+            # thread composes the compact status once with all other sources.
+            QTimer.singleShot(0, lambda value=count: self._on_recording_event_count(value))
 
         def _on_click_recorded(payload):
             self.recorder_overlay_bridge.ripple_requested.emit(dict(payload))
@@ -121,6 +150,9 @@ class ScreenBotApp:
         self.countdown_timer.setInterval(1000)
         self.countdown_timer.timeout.connect(self._countdown_tick)
         self.countdown_value = 0
+        self.start_handoff_timer = QTimer()
+        self.start_handoff_timer.setInterval(150)
+        self.start_handoff_timer.timeout.connect(self._on_start_handoff_tick)
         self.workflow_ui_timer = QTimer()
         self.workflow_ui_timer.setInterval(250)
         self.workflow_ui_timer.timeout.connect(self._update_workflow_runtime_ui)
@@ -196,9 +228,8 @@ class ScreenBotApp:
 
     def set_state(self, state, countdown_text=None):
         self.state = state
-        self.widget.set_status(state, countdown_text)
         self.widget.set_script_name(self.current_script.get("name") if self.current_script else "(未選擇)")
-        self.widget.set_target_title(self.window_tracker.target.title if self.window_tracker.target else "(未鎖定)")
+        self._refresh_compact_presentation(countdown_text=countdown_text)
         self.logger.info(f"狀態切換為 {state.name}")
 
     def _on_bridge_f8(self):
@@ -228,21 +259,55 @@ class ScreenBotApp:
         except Exception:
             self.logger.exception("Failed to show recorder ripple")
 
+    def _on_recording_event_count(self, count):
+        self._recorded_event_count = max(0, int(count))
+        self._refresh_compact_presentation()
+
     def _handle_f8(self):
-        self.logger.info("F8 熱鍵觸發")
+        """Lock or refresh the target only; F8 must never start execution."""
+        self.logger.info("F8 熱鍵觸發：僅鎖定／更新目標視窗")
         if self.workflow_runner.is_active():
-            self.logger.info("Workflow 執行中，忽略 F8")
+            # Changing the target during an active run would break the locked
+            # target contract.  Crucially, this branch still performs no
+            # countdown, player start, workflow start, or run-log creation.
+            self.logger.info("Workflow 執行中，忽略 F8 目標更新")
             return
-        if self.state == AppState.IDLE:
-            self._start_countdown()
-        elif self.state in {AppState.RUNNING, AppState.PAUSED}:
-            self.stop_script()
-        elif self.state == AppState.COUNTDOWN:
-            # cancel countdown
-            self.countdown_timer.stop()
-            self.set_state(AppState.IDLE)
-        else:
-            self.logger.debug("F8 在當前狀態無動作")
+        self.lock_or_refresh_target_only()
+
+    def lock_or_refresh_target_only(self):
+        """Refresh the explicit target lock without changing runtime state."""
+        self._record_overlay_diagnostic("TARGET_LOCK_REQUESTED")
+        try:
+            info = self.window_tracker.lock_foreground_window()
+            target_session = getattr(self, "target_session", None)
+            self._record_overlay_target_event(
+                "TARGET_LOCK_SUCCEEDED",
+                target_session.get_snapshot() if target_session is not None else None,
+            )
+            self._invalidate_armed_start("target_relocked", unavailable=False)
+            self.text_detector.invalidate_capture_target()
+            # A replacement target starts a fresh condition session.  F8 is
+            # still lock-only and this does not start a workflow or macro.
+            clear_memory = getattr(self.workflow_runner, "clear_condition_memory", None)
+            if callable(clear_memory):
+                clear_memory()
+            self._refresh_compact_presentation()
+            self.logger.info(
+                "Target locked/refreshed only: title=%s hwnd=%s client=%sx%s",
+                info.title,
+                getattr(info, "hwnd", None),
+                getattr(info, "client_width", None),
+                getattr(info, "client_height", None),
+            )
+            return info
+        except Exception as exc:
+            self._record_overlay_diagnostic(
+                "TARGET_LOCK_FAILED", exception_type=type(exc).__name__, message=str(exc)
+            )
+            self.logger.warning("鎖定目標視窗失敗: %s", exc)
+            self._refresh_compact_presentation()
+            self._show_message("無法鎖定目標視窗", str(exc))
+            return None
 
     def _handle_f9(self):
         self.logger.info("F9 熱鍵觸發")
@@ -273,7 +338,7 @@ class ScreenBotApp:
         try:
             info = self.window_tracker.lock_foreground_window()
             self.text_detector.invalidate_capture_target()
-            self.widget.set_target_title(info.title)
+            self._refresh_compact_presentation()
             self.logger.info(f"鎖定視窗: {info.title} pid={info.pid}")
             self._start_script()
         except Exception as exc:
@@ -283,6 +348,7 @@ class ScreenBotApp:
             self.set_state(AppState.IDLE)
 
     def _start_script(self):
+        """Arm the current script; actual input startup occurs only after handoff."""
         if self.workflow_runner.is_active():
             self._show_message("Workflow 執行中", "請先停止 Workflow，再執行單獨腳本。")
             self.set_state(AppState.IDLE)
@@ -291,16 +357,290 @@ class ScreenBotApp:
             self._show_message("腳本未選擇", "請先從控制面板選擇一個腳本。")
             self.set_state(AppState.IDLE)
             return
+        self._arm_start_request(
+            StartRequestKind.DIRECT_SCRIPT,
+            copy.deepcopy(self.current_script),
+            self.current_script.get("name") or self.selected_script_name or "獨立腳本",
+        )
+
+    def _arm_start_request(self, kind, frozen_payload, display_name):
+        self._record_overlay_diagnostic(
+            "START_INTENT_RECEIVED",
+            kind=getattr(kind, "value", str(kind)),
+            display_name=display_name,
+        )
+        expected = self.input_safety_gate.expected_current_session()
+        if expected is None:
+            self._show_message("請先鎖定目標視窗", "請先使用 F8 鎖定前景視窗，再開始執行。")
+            return False
+
+        request = self.start_handoff.create_request(
+            kind=kind,
+            target_session_id=expected.session_id,
+            target_generation=expected.generation,
+            display_name=display_name,
+            frozen_payload=frozen_payload,
+        )
+        result = self.start_handoff.arm(request)
+        if result.code is StartHandoffCode.ALREADY_ARMED:
+            self.logger.info("Start request ignored because request=%s is already armed", result.snapshot.request.request_id)
+            self._refresh_handoff_presentation()
+            return False
+
+        self.set_state(AppState.IDLE)
+        self.start_handoff_timer.start()
+        self._record_start_handoff_event("START_REQUEST_CREATED", result.snapshot, request=request)
+        self._record_start_handoff_event("START_REQUEST_ARMED", result.snapshot, request=request)
+        self._refresh_handoff_presentation()
+        # With the compact widget's no-activate policy the locked target remains
+        # foreground, so the normal product path commits in this same click.
+        # If Windows/Qt activated another root, the attempt safely remains ARMED.
+        self._attempt_start_handoff()
+        return True
+
+    def _on_start_handoff_tick(self):
+        self._attempt_start_handoff()
+
+    def _attempt_start_handoff(self):
+        snapshot = self.start_handoff.get_snapshot()
+        if snapshot.state is not StartHandoffState.ARMED or snapshot.request is None:
+            self.start_handoff_timer.stop()
+            self._refresh_handoff_presentation()
+            return
+
+        expired = self.start_handoff.expire_if_due()
+        if expired.code is StartHandoffCode.TIMED_OUT:
+            self.start_handoff_timer.stop()
+            self._record_start_handoff_event(
+                "START_REQUEST_TIMED_OUT", expired.snapshot, request=expired.request
+            )
+            self._refresh_handoff_presentation()
+            return
+
+        request = snapshot.request
         try:
-            self.player.start(self.current_script)
+            current = self.target_session.refresh()
+        except (OSError, RuntimeError):
+            transition = self.start_handoff.invalidate_target(
+                "target_refresh_failed", unavailable=True
+            )
+            self.start_handoff_timer.stop()
+            self._record_start_handoff_event(
+                "START_REQUEST_TARGET_UNAVAILABLE", transition.snapshot, request=transition.request
+            )
+            self._refresh_handoff_presentation()
+            return
+
+        if (
+            current is None
+            or current.session_id != request.target_session_id
+            or current.generation != request.target_generation
+        ):
+            transition = self.start_handoff.invalidate_target("target_changed")
+            self.start_handoff_timer.stop()
+            self._record_start_handoff_event(
+                "START_REQUEST_TARGET_CHANGED", transition.snapshot, request=transition.request
+            )
+            self._refresh_handoff_presentation()
+            return
+
+        expected = self.input_safety_gate.expected_current_session()
+        if expected is None or (
+            expected.session_id != request.target_session_id
+            or expected.generation != request.target_generation
+        ):
+            transition = self.start_handoff.invalidate_target("target_changed")
+            self.start_handoff_timer.stop()
+            self._record_start_handoff_event(
+                "START_REQUEST_TARGET_CHANGED", transition.snapshot, request=transition.request
+            )
+            self._refresh_handoff_presentation()
+            return
+
+        self._record_overlay_diagnostic(
+            "START_IMMEDIATE_AUTHORIZATION_BEGIN",
+            request_id=request.request_id,
+            authorization_phase="fast",
+        )
+        fast = self.input_safety_gate.authorize_foreground_input_fast(expected)
+        self._record_overlay_diagnostic(
+            "START_IMMEDIATE_AUTHORIZATION_RESULT",
+            request_id=request.request_id,
+            authorization_phase="fast",
+            authorization_code=fast.code.value,
+            foreground_hwnd=fast.foreground_hwnd,
+            foreground_root_hwnd=fast.foreground_root_hwnd,
+        )
+        if fast.code is InputAuthorizationCode.TARGET_NOT_FOREGROUND:
+            self._record_overlay_diagnostic(
+                "START_REQUEST_REMAINS_ARMED",
+                request_id=request.request_id,
+                reason=fast.code.value,
+            )
+            self._refresh_handoff_presentation()
+            return
+        if fast.code is not InputAuthorizationCode.ALLOWED:
+            transition = self.start_handoff.invalidate_target(
+                fast.code.value,
+                unavailable=True,
+            )
+            self.start_handoff_timer.stop()
+            self._record_start_handoff_event(
+                "START_REQUEST_TARGET_UNAVAILABLE", transition.snapshot, request=transition.request
+            )
+            self._refresh_handoff_presentation()
+            return
+
+        self._record_overlay_diagnostic(
+            "START_IMMEDIATE_AUTHORIZATION_BEGIN",
+            request_id=request.request_id,
+            authorization_phase="first_full",
+        )
+        first_authorization = self.input_safety_gate.authorize_foreground_input(expected)
+        self._record_overlay_diagnostic(
+            "START_IMMEDIATE_AUTHORIZATION_RESULT",
+            request_id=request.request_id,
+            authorization_phase="first_full",
+            authorization_code=first_authorization.code.value,
+            foreground_hwnd=first_authorization.foreground_hwnd,
+            foreground_root_hwnd=first_authorization.foreground_root_hwnd,
+        )
+        if first_authorization.code is InputAuthorizationCode.TARGET_NOT_FOREGROUND:
+            self._record_overlay_diagnostic(
+                "START_REQUEST_REMAINS_ARMED",
+                request_id=request.request_id,
+                reason=first_authorization.code.value,
+            )
+            self._refresh_handoff_presentation()
+            return
+        if not first_authorization.allowed:
+            transition = self.start_handoff.invalidate_target(
+                first_authorization.code.value,
+                unavailable=first_authorization.code is not InputAuthorizationCode.TARGET_CHANGED,
+            )
+            self.start_handoff_timer.stop()
+            event = (
+                "START_REQUEST_TARGET_CHANGED"
+                if first_authorization.code is InputAuthorizationCode.TARGET_CHANGED
+                else "START_REQUEST_TARGET_UNAVAILABLE"
+            )
+            self._record_start_handoff_event(event, transition.snapshot, request=transition.request)
+            self._refresh_handoff_presentation()
+            return
+
+        self._record_start_handoff_event(
+            "START_REQUEST_TARGET_READY",
+            snapshot,
+            authorization=first_authorization,
+        )
+        claim = self.start_handoff.claim_commit(request.request_id)
+        if claim.code is not StartHandoffCode.CLAIMED:
+            self._refresh_handoff_presentation()
+            return
+
+        self._record_start_handoff_event("START_REQUEST_COMMITTING", claim.snapshot, request=request)
+        self._record_overlay_diagnostic(
+            "START_IMMEDIATE_AUTHORIZATION_BEGIN",
+            request_id=request.request_id,
+            authorization_phase="final_full",
+        )
+        final_authorization = self.input_safety_gate.authorize_foreground_input(expected)
+        self._record_overlay_diagnostic(
+            "START_IMMEDIATE_AUTHORIZATION_RESULT",
+            request_id=request.request_id,
+            authorization_phase="final_full",
+            authorization_code=final_authorization.code.value,
+            foreground_hwnd=final_authorization.foreground_hwnd,
+            foreground_root_hwnd=final_authorization.foreground_root_hwnd,
+        )
+        if not final_authorization.allowed:
+            completed = self.start_handoff.complete_failed(
+                request.request_id, final_authorization.code.value
+            )
+            self.start_handoff_timer.stop()
+            self._record_start_handoff_event(
+                "START_REQUEST_FAILED",
+                completed.snapshot,
+                request=completed.request,
+                authorization=final_authorization,
+            )
+            self._refresh_handoff_presentation()
+            return
+
+        try:
+            if request.kind is StartRequestKind.DIRECT_SCRIPT:
+                start_result = self._start_script_from_handoff(
+                    request.frozen_payload, expected
+                )
+                started = start_result.status.name == "STARTED"
+                failure_reason = start_result.reason or start_result.status.value
+            else:
+                self._start_workflow_from_handoff(request.frozen_payload, expected)
+                started = True
+                failure_reason = None
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+            started = False
+            failure_reason = str(exc)
+
+        self.start_handoff_timer.stop()
+        if started:
+            completed = self.start_handoff.complete_started(request.request_id)
+            self._record_start_handoff_event(
+                "START_REQUEST_STARTED", completed.snapshot, request=completed.request
+            )
+        else:
+            completed = self.start_handoff.complete_failed(request.request_id, failure_reason)
+            self._record_start_handoff_event(
+                "START_REQUEST_FAILED", completed.snapshot, request=completed.request
+            )
+        self._record_overlay_diagnostic(
+            "START_REQUEST_STARTED" if started else "START_REQUEST_FAILED",
+            request_id=request.request_id,
+            failure_reason=failure_reason,
+        )
+        self._refresh_handoff_presentation()
+
+    def _start_script_from_handoff(self, frozen_script, expected_target):
+        result = self.player.start(frozen_script)
+        if result.status.name == "STARTED":
             self.set_state(AppState.RUNNING)
-        except Exception as exc:
-            self.logger.exception("啟動腳本失敗")
-            self.set_state(AppState.ERROR)
-            self._show_message("腳本啟動失敗", str(exc))
-            self.set_state(AppState.IDLE)
+        return result
+
+    def _cancel_armed_start(self, reason):
+        if not hasattr(self, "start_handoff"):
+            return False
+        transition = self.start_handoff.cancel(reason)
+        if transition.code is not StartHandoffCode.CANCELLED:
+            return False
+        self.start_handoff_timer.stop()
+        self._record_start_handoff_event(
+            "START_REQUEST_CANCELLED", transition.snapshot, request=transition.request
+        )
+        self.set_state(AppState.IDLE)
+        self._refresh_handoff_presentation()
+        return True
+
+    def _invalidate_armed_start(self, reason, unavailable):
+        if not hasattr(self, "start_handoff"):
+            return False
+        transition = self.start_handoff.invalidate_target(reason, unavailable=unavailable)
+        if transition.code not in {
+            StartHandoffCode.TARGET_CHANGED,
+            StartHandoffCode.TARGET_UNAVAILABLE,
+        }:
+            return False
+        self.start_handoff_timer.stop()
+        event = (
+            "START_REQUEST_TARGET_UNAVAILABLE"
+            if unavailable else "START_REQUEST_TARGET_CHANGED"
+        )
+        self._record_start_handoff_event(event, transition.snapshot, request=transition.request)
+        self._refresh_handoff_presentation()
+        return True
 
     def stop_script(self):
+        if self._cancel_armed_start("start_request_cancelled"):
+            return
         if self.state not in {AppState.RUNNING, AppState.PAUSED}:
             return
         self.player.stop()
@@ -329,7 +669,7 @@ class ScreenBotApp:
             return
         try:
             # reset UI counter
-            self.widget.set_event_count(0)
+            self._recorded_event_count = 0
             self.recorder.start()
             self.recorder_overlay.start()
             self.last_recording = None
@@ -351,7 +691,7 @@ class ScreenBotApp:
             # keep recording in memory but do not prompt save automatically
             self.last_recording = script
             self.last_recording_saved = False
-            self.widget.set_event_count(len(script.get("events", [])))
+            self._recorded_event_count = len(script.get("events", []))
             self.logger.info("Recording kept in memory; use 儲存錄製 to save to disk")
         self.set_state(AppState.IDLE)
         if self._macro_manager is not None:
@@ -432,6 +772,8 @@ class ScreenBotApp:
     def shutdown(self):
         self.logger.info("關閉 ScreenBot")
         self.countdown_timer.stop()
+        self.start_handoff_timer.stop()
+        self._cancel_armed_start("application_shutdown")
         self.workflow_ui_timer.stop()
         self.stop_workflow()
         self.stop_text_trigger()
@@ -444,6 +786,9 @@ class ScreenBotApp:
         if self.player.is_active():
             self.player.stop()
         self.text_detector.close()
+        target_session = getattr(self, "target_session", None)
+        if target_session is not None:
+            target_session.clear("application_shutdown")
         self._unregister_hotkeys()
         pos = self.widget.pos()
         self.settings.set("bubble_position", [pos.x(), pos.y()])
@@ -452,6 +797,8 @@ class ScreenBotApp:
         if self._workflow_debug_panel is not None:
             self._workflow_debug_panel.close()
         self.widget.close()
+        if self.overlay_diagnostics is not None:
+            self.overlay_diagnostics.close()
         self.app.quit()
 
     def configure_text_trigger(self, trigger_data):
@@ -500,8 +847,26 @@ class ScreenBotApp:
         return data
 
     def start_workflow(self):
+        """Arm an already resolved workflow rather than starting it immediately."""
         if self.workflow_data is None:
             raise RuntimeError("Workflow is not loaded")
+        # Compatibility for existing isolated tests that deliberately construct
+        # a partial coordinator without target safety or handoff services.
+        if not hasattr(self, "start_handoff") or not hasattr(self, "input_safety_gate"):
+            self._run_loaded_workflow()
+            return
+        self._arm_start_request(
+            StartRequestKind.WORKFLOW,
+            copy.deepcopy(self.workflow_data),
+            self.workflow_data.get("name") or self.selected_workflow_filename or "工作流",
+        )
+
+    def _start_workflow_from_handoff(self, frozen_workflow, expected_target):
+        self.workflow_data = copy.deepcopy(frozen_workflow)
+        self.workflow_runner.load_workflow(self.workflow_data)
+        self._run_loaded_workflow()
+
+    def _run_loaded_workflow(self):
         if self.workflow_runner.is_active():
             raise RuntimeError("Workflow is already running")
         if self.state == AppState.RECORDING:
@@ -509,21 +874,39 @@ class ScreenBotApp:
         if self.window_tracker.target is None:
             raise RuntimeError("請先鎖定目標視窗")
         self.stop_text_trigger()
+        self.workflow_ui_state = "STARTING"
+        self._update_workflow_runtime_ui()
         self.workflow_diagnostics.mark_workflow_started(
             self.workflow_data,
             target=self.window_tracker.target,
             capture_backend=(self.text_detector.get_capture_runtime_diagnostics() or {}).get("selected_backend"),
         )
         self.workflow_runner.start()
-        self.workflow_ui_state = "WAIT_TRIGGER"
+        # The runner snapshot becomes authoritative as soon as its worker
+        # advances.  STARTING remains only as the short hand-off state.
         self.widget.set_workflow_running(True)
         self.logger.info("Workflow started: %s", self.workflow_data.get("name"))
         self._update_workflow_runtime_ui()
 
     def stop_workflow(self):
+        if self._cancel_armed_start("start_request_cancelled"):
+            return
+        if not self.workflow_runner.is_active():
+            # Stop is intentionally idempotent: no inactive run is created or
+            # finalized merely because the user pressed the button again.
+            self.workflow_ui_state = "IDLE"
+            self.widget.set_workflow_running(False)
+            self._update_workflow_runtime_ui()
+            return
+        self.workflow_ui_state = "STOPPING"
+        self.workflow_diagnostics.mark_workflow_stop_requested()
+        self._update_workflow_runtime_ui()
+        # Let the requested STOPPING state paint before the bounded runner
+        # join below.  This is a one-shot UI hand-off, never a poll action.
+        QApplication.processEvents()
         self.workflow_runner.stop()
-        self.workflow_diagnostics.mark_workflow_stopped()
         self.workflow_ui_state = "STOPPED"
+        self.workflow_diagnostics.mark_workflow_stopped()
         self.widget.set_workflow_running(False)
         self.logger.info("Workflow stopped")
         self._update_workflow_runtime_ui()
@@ -557,9 +940,13 @@ class ScreenBotApp:
                 self._show_message("請選擇 Workflow", "請先從下拉選單選擇 Workflow。")
                 return
             workflow = self.workflow_store.load_workflow(filename)
-            self.load_workflow(workflow)
-            self.start_workflow()
-        except Exception as exc:
+            resolved_workflow = self.workflow_resolver.resolve(workflow)
+            self._arm_start_request(
+                StartRequestKind.WORKFLOW,
+                copy.deepcopy(resolved_workflow),
+                resolved_workflow.get("name") or filename,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError, KeyError) as exc:
             self.logger.exception("啟動 Workflow 失敗")
             self.workflow_diagnostics.mark_workflow_error(f"Workflow Start Error: {exc}")
             self.workflow_diagnostics.finalize_run("FAILED")
@@ -630,6 +1017,7 @@ class ScreenBotApp:
         self._workflow_editor = WorkflowEditor(
             self.workflow_store,
             self.script_store,
+            trigger_store=self.trigger_store,
             get_running_filename=self._get_running_workflow_filename,
             logger=self.logger,
             window_tracker=self.window_tracker,
@@ -688,6 +1076,10 @@ class ScreenBotApp:
                 f"w={region.get('width_ratio')}, h={region.get('height_ratio')}"
             )
 
+        target_session = getattr(self, "target_session", None)
+        target_snapshot = (
+            target_session.get_snapshot() if target_session is not None else None
+        )
         target = self.window_tracker.target
         target_hwnd = None
         target_title = None
@@ -708,6 +1100,8 @@ class ScreenBotApp:
                 foreground_status = "FOREGROUND" if fg_hwnd == target.hwnd else f"BACKGROUND (fg={fg_hwnd})"
             except Exception:
                 foreground_status = "N/A"
+        if target_snapshot is not None:
+            foreground_status = target_snapshot.visibility_state.value
 
         observation = trigger_status.get("observation") or {}
         trigger_state = "(未知)"
@@ -796,19 +1190,90 @@ class ScreenBotApp:
             "window_valid": window_valid,
             "window_rect": window_rect,
             "foreground_status": foreground_status,
+            "target_session_id": (
+                target_snapshot.session_id if target_snapshot is not None else None
+            ),
+            "target_generation": (
+                target_snapshot.generation if target_snapshot is not None else None
+            ),
+            "target_connection_state": (
+                target_snapshot.connection_state.value
+                if target_snapshot is not None
+                else "UNLOCKED"
+            ),
+            "target_visibility_state": (
+                target_snapshot.visibility_state.value
+                if target_snapshot is not None
+                else "UNKNOWN"
+            ),
+            "target_pid": target_snapshot.pid if target_snapshot is not None else None,
+            "target_root_hwnd": (
+                target_snapshot.root_hwnd if target_snapshot is not None else None
+            ),
+            "target_client_hwnd": (
+                target_snapshot.client_hwnd if target_snapshot is not None else None
+            ),
+            "target_client_size": (
+                target_snapshot.current_client_size
+                if target_snapshot is not None
+                else None
+            ),
+            "target_dpi": target_snapshot.dpi if target_snapshot is not None else None,
+            "target_executable_path": (
+                target_snapshot.executable_path
+                if target_snapshot is not None
+                else None
+            ),
+            "target_process_creation_time": (
+                target_snapshot.process_creation_time
+                if target_snapshot is not None
+                else None
+            ),
+            "target_window_class": (
+                target_snapshot.window_class if target_snapshot is not None else None
+            ),
+            "target_identity_strength": (
+                target_snapshot.identity_strength
+                if target_snapshot is not None
+                else None
+            ),
+            "target_identity_degraded_reason": (
+                target_snapshot.identity_degraded_reason
+                if target_snapshot is not None
+                else None
+            ),
+            "target_disconnect_reason": (
+                target_snapshot.disconnect_reason
+                if target_snapshot is not None
+                else None
+            ),
+            "target_locked_at_monotonic": (
+                target_snapshot.locked_at if target_snapshot is not None else None
+            ),
+            "target_last_validated_at_monotonic": (
+                target_snapshot.last_validated_at
+                if target_snapshot is not None
+                else None
+            ),
             "last_error": last_error if last_error else "None",
             "error_timestamp": error_time,
             "error_source": error_source,
             "timeline_lines": timeline_lines,
             "stop_trigger_enabled": stop_runtime.get("enabled"),
+            "stop_trigger_id": stop_runtime.get("trigger_id"),
+            "stop_trigger_name": stop_runtime.get("trigger_name"),
             "stop_trigger_type": stop_runtime.get("trigger_type"),
             "stop_trigger_event": stop_runtime.get("trigger_event"),
+            "stop_trigger_condition": stop_runtime.get("trigger_condition"),
+            "stop_trigger_condition_label": stop_runtime.get("trigger_condition_label"),
             "stop_trigger_text": stop_runtime.get("trigger_text"),
             "stop_trigger_state": stop_state,
             "stop_confirm_progress": stop_runtime.get("confirm_progress"),
             "stop_last_ocr_text": stop_runtime.get("last_ocr_text"),
             "pending_stop": stop_runtime.get("pending_stop"),
             "stop_trigger_timestamp": stop_runtime.get("matched_time"),
+            "stop_source": stop_runtime.get("stop_source") or snapshot.get("stop_source"),
+            "stop_trigger_macro_cancel_requested": stop_runtime.get("macro_cancel_requested"),
         }
 
     def _build_text_state(self, trigger_runtime):
@@ -827,20 +1292,257 @@ class ScreenBotApp:
             return "不存在"
         return "(未知)"
 
+    def _target_compact_status(self):
+        target_session = getattr(self, "target_session", None)
+        if target_session is not None:
+            snapshot = target_session.get_snapshot()
+            target = self.window_tracker.target
+            if snapshot is None:
+                return None, False
+            return (
+                target,
+                snapshot.connection_state == TargetConnectionState.ATTACHED
+                and snapshot.identity_valid,
+            )
+        target = self.window_tracker.target
+        if target is None:
+            return None, False
+        try:
+            valid = bool(target.is_valid()) if callable(getattr(target, "is_valid", None)) else bool(getattr(target, "hwnd", None))
+        except Exception:
+            valid = False
+        return target, valid
+
+    def _record_overlay_diagnostic(self, event, **data):
+        diagnostics = getattr(self, "overlay_diagnostics", None)
+        if diagnostics is None or not diagnostics.enabled:
+            return
+        diagnostics.record_event(
+            event,
+            interaction_id=diagnostics.current_interaction_id(),
+            **data,
+        )
+
+    def _record_overlay_target_event(self, event, snapshot=None, **data):
+        diagnostics = getattr(self, "overlay_diagnostics", None)
+        if diagnostics is None or not diagnostics.enabled:
+            return
+        diagnostics.observe_target_event(event, snapshot, **data)
+
+    def _on_overlay_target_session_event(self, event, snapshot, payload):
+        event_map = {
+            "TARGET_SESSION_CREATED": "TARGET_SESSION_CHANGED",
+            "TARGET_STATE_CHANGED": "TARGET_VISIBILITY_CHANGED",
+            "TARGET_DISCONNECTED": "TARGET_DISCONNECTED",
+            "TARGET_SESSION_CLEARED": "TARGET_SESSION_CHANGED",
+        }
+        diagnostic_event = event_map.get(event)
+        if diagnostic_event is not None:
+            self._record_overlay_target_event(
+                diagnostic_event,
+                snapshot,
+                target_session_event=event,
+                target_payload=payload,
+            )
+
+    def _record_start_handoff_event(self, event, snapshot, request=None, authorization=None):
+        request = request or snapshot.request
+        authorization = authorization or object()
+        auth_snapshot = getattr(authorization, "snapshot", None)
+        data = {
+            "request_id": getattr(request, "request_id", None),
+            "kind": getattr(getattr(request, "kind", None), "value", None),
+            "display_name": getattr(request, "display_name", snapshot.display_name),
+            "expected_session_id": getattr(request, "target_session_id", None),
+            "expected_generation": getattr(request, "target_generation", None),
+            "current_session_id": getattr(auth_snapshot, "session_id", None),
+            "current_generation": getattr(auth_snapshot, "generation", None),
+            "locked_root_hwnd": getattr(auth_snapshot, "root_hwnd", None),
+            "foreground_hwnd": getattr(authorization, "foreground_hwnd", 0),
+            "foreground_root_hwnd": getattr(authorization, "foreground_root_hwnd", 0),
+            "request_age_ms": (
+                int(round((time.monotonic() - request.requested_at_monotonic) * 1000))
+                if request is not None else None
+            ),
+            "remaining_ms": snapshot.remaining_ms,
+            "handoff_state": snapshot.state.value,
+            "start_outcome": event,
+            "reason": snapshot.reason,
+            "timestamp": time.time(),
+        }
+        recorder = getattr(self.workflow_diagnostics, "record_start_handoff_event", None)
+        if callable(recorder):
+            recorder(event, data)
+        else:
+            self.logger.info("%s %s", event, data)
+        self._record_overlay_diagnostic(event, **data)
+
+    def _refresh_handoff_presentation(self):
+        handoff_service = getattr(self, "start_handoff", None)
+        if handoff_service is None:
+            return None
+        snapshot = handoff_service.get_snapshot()
+        presenter = getattr(self.widget, "set_start_handoff_presentation", None)
+        if callable(presenter):
+            presenter(snapshot)
+        self._refresh_compact_presentation()
+        return snapshot
+
+    def _build_compact_status_view_model(self, snapshot=None, workflow_info=None, countdown_text=None):
+        """Compose UI-only compact status without changing any runtime state."""
+        snapshot = snapshot or self.workflow_runner.get_runtime_snapshot()
+        workflow_info = workflow_info or {}
+        workflow_status = workflow_info.get("status") or self._resolve_workflow_ui_status(snapshot)
+        target, target_valid = self._target_compact_status()
+        target_title = getattr(target, "title", "") or "(未知目標)"
+        if target is None:
+            target_text = "目標：未鎖定"
+        elif target_valid:
+            target_text = f"目標：已鎖定「{target_title}」"
+        else:
+            target_text = f"目標：已失效「{target_title}」"
+
+        error = workflow_info.get("last_error") or workflow_info.get("step_start_error") or snapshot.get("error")
+        input_safety = snapshot.get("input_safety") or {}
+        app_state = self.state.name if hasattr(self.state, "name") else str(self.state)
+        cycle = workflow_info.get("current_cycle") or snapshot.get("current_cycle") or 0
+        workflow_name = workflow_info.get("workflow_name") or snapshot.get("workflow_name") or "工作流"
+        trigger_text = workflow_info.get("trigger_text") or snapshot.get("trigger_text") or "觸發條件"
+        trigger_event = workflow_info.get("trigger_event") or snapshot.get("trigger_event") or ""
+        macro = workflow_info.get("macro") or snapshot.get("macro") or "巨集"
+        handoff_service = getattr(self, "start_handoff", None)
+        handoff = handoff_service.get_snapshot() if handoff_service is not None else None
+
+        if handoff is not None and handoff.state is StartHandoffState.ARMED:
+            remaining_seconds = max(0, (handoff.remaining_ms + 999) // 1000)
+            visual_state, status_text = "START_ARMED", "等待目標前景"
+            operation_text = (
+                f"目前操作：請切回「{target_title}」以開始執行｜剩餘：{remaining_seconds} 秒"
+            )
+        elif handoff is not None and handoff.state is StartHandoffState.COMMITTING:
+            visual_state, status_text = "STARTING", "正在確認目標並啟動"
+            operation_text = "目前操作：正在執行最終目標授權確認"
+        elif handoff is not None and handoff.state is StartHandoffState.TIMED_OUT:
+            visual_state, status_text = "INPUT_BLOCKED", "啟動未執行"
+            operation_text = "目前操作：目標未在時間內回到前景"
+        elif handoff is not None and handoff.state is StartHandoffState.TARGET_CHANGED:
+            visual_state, status_text = "TARGET_INVALID", "啟動已取消"
+            operation_text = "目前操作：鎖定目標已改變"
+        elif handoff is not None and handoff.state is StartHandoffState.TARGET_UNAVAILABLE:
+            visual_state, status_text = "TARGET_INVALID", "啟動已取消"
+            operation_text = "目前操作：目標目前不可用"
+        elif handoff is not None and handoff.state is StartHandoffState.FAILED:
+            visual_state, status_text = "ERROR", "啟動未執行"
+            operation_text = f"目前操作：{handoff.reason or '目標授權失敗'}"
+        elif input_safety.get("blocked"):
+            visual_state, status_text = "INPUT_BLOCKED", "輸入已阻擋"
+            operation_text = f"目前操作：目標不是有效前景視窗（{input_safety.get('reason') or 'unknown'}）"
+        elif error or workflow_status == "ERROR" or app_state == "ERROR":
+            visual_state, status_text = "ERROR", "執行錯誤"
+            operation_text = f"目前操作：{error or '未知錯誤'}"
+        elif workflow_status == "STOPPING":
+            visual_state, status_text = "STOPPING", "正在停止"
+            operation_text = "目前操作：正在安全停止工作流"
+        elif workflow_status == "RUNNING_MACRO":
+            visual_state, status_text = "RUNNING_MACRO", "執行巨集中"
+            operation_text = f"目前操作：正在執行「{macro}」｜循環：{cycle}"
+        elif workflow_status == "WAIT_TRIGGER":
+            if input_safety.get("suspended"):
+                visual_state, status_text = "WAIT_TRIGGER", "等待觸發（輸入暫停）"
+                operation_text = "目前操作：目標已鎖定；一般觸發暫停，Global Stop 仍在監測"
+            else:
+                visual_state, status_text = "WAIT_TRIGGER", "等待觸發"
+                condition = f"{trigger_event}「{trigger_text}」" if trigger_event else f"「{trigger_text}」"
+                operation_text = f"目前操作：等待{condition}｜循環：{cycle}"
+        elif workflow_status == "STARTING":
+            visual_state, status_text = "STARTING", "正在啟動工作流"
+            operation_text = f"目前操作：正在準備「{workflow_name}」"
+        elif app_state == "RECORDING":
+            visual_state, status_text = "RECORDING", "錄製巨集中"
+            operation_text = f"目前操作：已錄製 {self._recorded_event_count} 個有效操作"
+        elif app_state == "COUNTDOWN":
+            visual_state, status_text = "COUNTDOWN", "即將執行"
+            seconds = countdown_text or (f"{self.countdown_value}s" if self.countdown_value else "")
+            operation_text = f"目前操作：{seconds} 後開始".replace("  後", " 後")
+        elif app_state == "RUNNING":
+            visual_state, status_text = "STANDALONE_RUNNING", "執行腳本中"
+            operation_text = f"目前操作：正在執行「{self.current_script.get('name') if self.current_script else '獨立腳本'}」"
+        elif app_state == "PAUSED":
+            visual_state, status_text = "PAUSED", "已暫停"
+            operation_text = "目前操作：等待繼續或停止"
+        elif target is not None and not target_valid:
+            visual_state, status_text = "TARGET_INVALID", "目標已失效"
+            operation_text = "目前操作：請重新聚焦目標並按 F8"
+        elif target_valid:
+            visual_state, status_text = "TARGET_READY", "目標已鎖定／待命"
+            operation_text = f"目前操作：已鎖定「{target_title}」，尚未執行工作流"
+            target_session = getattr(self, "target_session", None)
+            target_snapshot = (
+                target_session.get_snapshot()
+                if target_session is not None
+                else None
+            )
+            if target_snapshot is not None:
+                visibility_labels = {
+                    "FOREGROUND": "前景",
+                    "BACKGROUND": "背景",
+                    "MINIMIZED": "最小化",
+                    "HIDDEN": "隱藏",
+                    "UNKNOWN": "未知",
+                }
+                visibility = visibility_labels.get(
+                    target_snapshot.visibility_state.value,
+                    target_snapshot.visibility_state.value,
+                )
+                operation_text += f"｜目標狀態：{visibility}"
+        else:
+            visual_state, status_text = "NO_TARGET", "未鎖定目標"
+            operation_text = "目前操作：請按 F8 鎖定目標視窗"
+
+        return {
+            "visual_state": visual_state,
+            "target_text": target_text,
+            "target_full_title": target_title if target is not None else "",
+            "target_valid": target_valid,
+            "status_text": status_text,
+            "operation_text": operation_text,
+            "recording_event_count": self._recorded_event_count,
+        }
+
+    def _refresh_compact_presentation(self, snapshot=None, workflow_info=None, countdown_text=None):
+        view_model = self._build_compact_status_view_model(snapshot, workflow_info, countdown_text)
+        renderer = getattr(self.widget, "render_compact_status", None)
+        if callable(renderer):
+            renderer(view_model)
+        else:
+            # Minimal compatibility for external test doubles; the live widget
+            # always renders through render_compact_status().
+            self.widget.set_target_title(view_model["target_text"])
+        return view_model
+
     def _resolve_workflow_ui_status(self, snapshot):
-        if self.workflow_ui_state == "ERROR":
+        runner_state = snapshot.get("state", "IDLE")
+        if getattr(self.workflow_runner, "last_error", None) or runner_state == "ERROR":
             return "ERROR"
-        if self.workflow_runner.last_error:
-            return "ERROR"
-        if self.workflow_runner.state.name == "FINISHED":
-            return "FINISHED"
+        if self.workflow_ui_state == "STOPPING":
+            return "STOPPING"
         if self.workflow_runner.is_active():
-            return snapshot.get("state", "WAIT_TRIGGER")
-        if self.workflow_ui_state == "STOPPED":
+            return runner_state
+        if runner_state == "FINISHED":
+            return "FINISHED"
+        if runner_state == "STOPPED" or self.workflow_ui_state == "STOPPED":
             return "STOPPED"
+        if self.workflow_ui_state == "STARTING":
+            return "STARTING"
         return "IDLE"
 
     def _update_workflow_runtime_ui(self):
+        target_session = getattr(self, "target_session", None)
+        if target_session is not None:
+            try:
+                target_session.refresh()
+            except Exception:
+                self.logger.exception("TargetSession periodic refresh failed")
         snapshot = self.workflow_runner.get_runtime_snapshot()
         self.workflow_diagnostics.update_from_snapshot(snapshot)
         trigger_runtime = snapshot.get("trigger_runtime") or {}
@@ -881,9 +1583,12 @@ class ScreenBotApp:
             "max_cycles": snapshot.get("max_cycles"),
             "restart_step": snapshot.get("restart_step"),
             "finish_reason": snapshot.get("finish_reason"),
+            "last_error": snapshot.get("error"),
+            "step_start_error": snapshot.get("step_start_error"),
         }
         self.widget.set_workflow_runtime_info(info)
-        self.widget.set_workflow_running(self.workflow_runner.is_active())
+        self.widget.set_workflow_running(status in {"STARTING", "WAIT_TRIGGER", "RUNNING_MACRO", "STOPPING"})
+        self._refresh_handoff_presentation()
 
     def _handle_player_error(self, reason):
         QTimer.singleShot(0, lambda: self._on_player_error(reason))

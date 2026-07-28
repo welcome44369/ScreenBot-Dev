@@ -4,6 +4,7 @@ import time
 from datetime import datetime
 
 from app.text_trigger import TextTrigger
+from app.trigger_conditions import normalize_condition
 
 
 class TriggerRunner:
@@ -16,6 +17,11 @@ class TriggerRunner:
         logger=None,
         on_status=None,
         stop_on_error=False,
+        condition_memory=None,
+        can_start_macro=None,
+        expected_target_session=None,
+        input_safety_gate=None,
+        on_input_blocked=None,
     ):
         self.text_detector = text_detector
         self.script_store = script_store
@@ -23,14 +29,9 @@ class TriggerRunner:
         self.logger = logger or logging.getLogger("ScreenBot")
         self.trigger_data = self._validate_trigger_data(trigger_data)
         trigger_config = self.trigger_data["trigger"]
-        self.text_trigger = TextTrigger(
-            target_text=trigger_config.get("texts") or trigger_config["text"],
-            event=trigger_config["event"],
-            confirm_frames=trigger_config.get("confirm_frames", 1),
-            cooldown_ms=trigger_config.get("cooldown_ms", 0),
-            min_absent_duration_ms=trigger_config.get("min_absent_duration_ms", 5000),
-            observation_config=trigger_config.get("observation"),
-        )
+        self._condition_memory = condition_memory
+        self.text_trigger = self._new_text_trigger()
+        self._foreground_restored = True
         self._thread = None
         self._stop_event = threading.Event()
         self._poll_interval_ms = trigger_config.get("poll_interval_ms", 500)
@@ -39,6 +40,14 @@ class TriggerRunner:
         self._status_lock = threading.Lock()
         self._on_status = on_status
         self._stop_on_error = stop_on_error
+        self._can_start_macro = can_start_macro
+        self._expected_target_session = expected_target_session
+        self._input_safety_gate = input_safety_gate
+        self._on_input_blocked = on_input_blocked
+        self._input_suspended = False
+        self._input_blocked_reason = None
+        self._last_authorization = None
+        self._foreground_restored = False
         self._last_ocr_text = ""
         self._last_result = None
         self._last_error = None
@@ -50,6 +59,8 @@ class TriggerRunner:
         self._consecutive_failure = 0
         self._macro_started_at = None
         self._last_macro_duration_ms = 0
+        self._foreground_restored = False
+        self._trigger_fired = False
 
     def start(self):
         if self._thread is not None and self._thread.is_alive():
@@ -65,11 +76,12 @@ class TriggerRunner:
         self._consecutive_failure = 0
         self._macro_started_at = None
         self._last_macro_duration_ms = 0
+        self._trigger_fired = False
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop(self):
-        self._stop_event.set()
+        self.request_stop()
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
@@ -78,12 +90,43 @@ class TriggerRunner:
         self._macro_started_at = None
         self._macro_running = False
 
+    def request_stop(self):
+        """Request polling cancellation without joining the caller's thread."""
+        self._stop_event.set()
+
     def is_active(self):
         return self._thread is not None and self._thread.is_alive()
 
     def _run(self):
         while not self._stop_event.is_set():
             try:
+                # A step runner owns exactly one trigger fire.  Player and
+                # WorkflowRunner own the resulting playback lifecycle.
+                if self._trigger_fired:
+                    self._stop_event.set()
+                    break
+                # Do not consume step-trigger edges while global input is unsafe.
+                # Global Stop is owned by WorkflowRunner and deliberately remains active.
+                if self._input_safety_gate is not None:
+                    authorization = self._input_safety_gate.authorize_foreground_input(self._expected_target_session)
+                    if not authorization.allowed:
+                        reason = authorization.code.value
+                        if reason == "TARGET_NOT_FOREGROUND":
+                            self._last_authorization = authorization
+                            self._foreground_restored = False
+                            self._input_suspended = True
+                            self._publish_status(); self._wait_interval(); continue
+                        self._last_authorization = authorization
+                        self._last_error = f"target_unavailable:{reason}"
+                        self._stop_event.set()
+                        self._publish_status()
+                        break
+                    if self._input_suspended:
+                        # Confirmation is ephemeral, while the supplied memory
+                        # retains run-scoped edge/LOST state across suspension.
+                        self.text_trigger = self._new_text_trigger()
+                        self._foreground_restored = True
+                    self._input_suspended = False
                 if self.player.is_active():
                     self._macro_running = True
                     self._publish_status()
@@ -100,6 +143,7 @@ class TriggerRunner:
                     self.text_trigger.target_texts,
                     self.trigger_data["trigger"].get("observation"),
                 )
+
                 ocr_text = observation.recognized_text
                 result = self.text_trigger.update(observation)
                 self.logger.info(
@@ -107,6 +151,8 @@ class TriggerRunner:
                     observation.state, observation.exact_match, observation.text_similarity,
                     observation.readability_score, observation.presence_score, observation.reason,
                 )
+                for condition_event in result.condition_events:
+                    self.logger.info("%s %s", condition_event["event"], condition_event["data"])
                 with self._status_lock:
                     self._last_ocr_text = ocr_text
                     self._last_result = result
@@ -115,13 +161,27 @@ class TriggerRunner:
                     self._consecutive_success += 1
                     self._consecutive_failure = 0
                 if result.triggered:
+                    if callable(self._can_start_macro) and not self._can_start_macro():
+                        self.logger.info("Text trigger matched but macro start was blocked by workflow stop")
+                        self._publish_status()
+                        self._wait_interval()
+                        continue
                     macro_script = self._get_macro_script()
-                    self.player.start(macro_script)
+                    start_result = self.player.start(macro_script, expected_target=self._expected_target_session)
+                    if start_result.status.name == "INPUT_BLOCKED":
+                        self._input_blocked_reason = start_result.reason
+                        if callable(self._on_input_blocked): self._on_input_blocked(start_result.reason)
+                        self._stop_event.set(); self._publish_status(); break
+                    if start_result.status.name != "STARTED":
+                        raise RuntimeError(start_result.reason or start_result.status.value)
                     self._macro_running = True
                     self._macro_started_at = time.monotonic()
                     self._trigger_fire_count += 1
                     self._macro_start_count += 1
+                    self._trigger_fired = True
                     self.logger.info("Text trigger fired: %s -> %s", result.event_name, self.trigger_data["macro"])
+                    self._publish_status()
+                    break
                 self._publish_status()
                 self._wait_interval()
             except Exception as exc:
@@ -138,6 +198,33 @@ class TriggerRunner:
 
     def _wait_interval(self):
         self._stop_event.wait(self._poll_interval_ms / 1000.0)
+
+    def _new_text_trigger(self):
+        trigger_config = self.trigger_data["trigger"]
+        return TextTrigger(
+            target_text=trigger_config.get("texts") or trigger_config["text"],
+            event=trigger_config.get("event"),
+            condition=trigger_config.get("condition"),
+            condition_memory=self._condition_memory,
+            confirm_frames=trigger_config.get("confirm_frames", 1),
+            cooldown_ms=trigger_config.get("cooldown_ms", 0),
+            min_absent_duration_ms=trigger_config.get("min_absent_duration_ms", 5000),
+            observation_config=trigger_config.get("observation"),
+        )
+
+    def _authorization_snapshot(self):
+        authorization = self._last_authorization
+        snapshot = getattr(authorization, "snapshot", None)
+        return {
+            "code": getattr(getattr(authorization, "code", None), "value", None),
+            "foreground_hwnd": getattr(authorization, "foreground_hwnd", 0),
+            "foreground_root_hwnd": getattr(authorization, "foreground_root_hwnd", 0),
+            "locked_root_hwnd": getattr(snapshot, "root_hwnd", 0),
+            "current_session_id": getattr(snapshot, "session_id", None),
+            "current_generation": getattr(snapshot, "generation", None),
+            "target_pid": getattr(snapshot, "pid", None),
+            "target_visibility": getattr(getattr(snapshot, "visibility_state", None), "value", None),
+        }
 
     def _get_macro_script(self):
         if self._macro_script is None:
@@ -157,10 +244,15 @@ class TriggerRunner:
                 "poll_count": self._poll_count,
                 "trigger_fire_count": self._trigger_fire_count,
                 "macro_start_count": self._macro_start_count,
+                "trigger_fired": self._trigger_fired,
                 "last_ocr_success_time": self._last_ocr_success_time,
                 "consecutive_success": self._consecutive_success,
                 "consecutive_failure": self._consecutive_failure,
                 "last_macro_duration_ms": self._last_macro_duration_ms,
+                "input_suspended": self._input_suspended,
+                "input_blocked_reason": self._input_blocked_reason,
+                "input_authorization": self._authorization_snapshot(),
+                "foreground_restored": self._foreground_restored,
                 "trigger_result": {
                     "triggered": result.triggered if result else False,
                     "event_name": result.event_name if result else None,
@@ -168,7 +260,8 @@ class TriggerRunner:
                 },
                 "trigger_status": trigger_status,
                 "trigger_text": self.trigger_data["trigger"]["text"],
-                "trigger_event": self.trigger_data["trigger"]["event"],
+                "trigger_event": self.trigger_data["trigger"].get("event"),
+                "trigger_condition": self.trigger_data["trigger"].get("condition"),
                 "macro": self.trigger_data["macro"],
                 "capture_diagnostics": self.text_detector.get_capture_runtime_diagnostics(),
             }
@@ -248,8 +341,7 @@ class TriggerRunner:
             raise ValueError("Trigger config missing trigger block")
         if trigger.get("type") != "text":
             raise ValueError("Only text triggers are supported")
-        if trigger.get("event") not in {"appear", "disappear"}:
-            raise ValueError("Trigger event must be 'appear' or 'disappear'")
+        normalize_condition(trigger.get("condition"), trigger.get("event"))
         if not isinstance(trigger.get("text"), str) or not trigger["text"]:
             raise ValueError("Trigger text must be non-empty")
         region = trigger.get("region")
