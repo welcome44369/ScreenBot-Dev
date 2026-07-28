@@ -67,15 +67,22 @@ class FloatingWidget(QWidget):
     open_trigger_manager = Signal()
     open_macro_manager = Signal()
     open_workflow_manager = Signal()
+    compact_hwnd_changed = Signal(int, int)
+    compact_geometry_changed = Signal()
+    compact_visibility_intent_changed = Signal(bool)
 
     def __init__(self, root_path, native_no_activate_adapter=None, overlay_diagnostics=None):
-        super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setWindowFlag(Qt.WindowDoesNotAcceptFocus)
         self.setFocusPolicy(Qt.NoFocus)
         self.root_path = Path(root_path)
         self._overlay_diagnostics = overlay_diagnostics
         self._native_hwnd = 0
+        self._ui_visibility_intent = True
+        self._coordinator_visibility_change = False
+        self._target_visibility_suppressed = False
         self.drag_position = None
         self.drag_started = False
         self.expanded = False
@@ -124,7 +131,10 @@ class FloatingWidget(QWidget):
                     old_hwnd=current_hwnd,
                     new_hwnd=current_hwnd,
                 )
-            return self._native_no_activate_adapter.apply(current_hwnd)
+            applied = self._native_no_activate_adapter.apply(current_hwnd)
+            if current_hwnd != previous_hwnd:
+                self.compact_hwnd_changed.emit(previous_hwnd, current_hwnd)
+            return applied
         except (OSError, RuntimeError, TypeError):
             return False
 
@@ -135,6 +145,9 @@ class FloatingWidget(QWidget):
             return False
 
     def showEvent(self, event):
+        if not self._coordinator_visibility_change:
+            self._ui_visibility_intent = True
+            self.compact_visibility_intent_changed.emit(True)
         self._observe_lifecycle("COMPACT_SHOW_EVENT_BEFORE")
         super().showEvent(event)
         self._observe_lifecycle("COMPACT_SHOW_EVENT_AFTER")
@@ -695,12 +708,46 @@ class FloatingWidget(QWidget):
         menu.exec(QCursor.pos())
 
     def hideEvent(self, event):
+        if not self._coordinator_visibility_change:
+            self._ui_visibility_intent = False
+            self.compact_visibility_intent_changed.emit(False)
         self._observe_lifecycle("COMPACT_HIDE_EVENT")
         super().hideEvent(event)
 
     def closeEvent(self, event):
+        if not self._coordinator_visibility_change:
+            self._ui_visibility_intent = False
+            self.compact_visibility_intent_changed.emit(False)
         self._observe_lifecycle("COMPACT_CLOSE_EVENT")
         super().closeEvent(event)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.compact_geometry_changed.emit()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.compact_geometry_changed.emit()
+
+    def is_compact_visibility_intended(self):
+        return self._ui_visibility_intent
+
+    def set_target_visibility_suppressed(self, suppressed):
+        """Apply target lifecycle suppression without changing user intent."""
+        suppressed = bool(suppressed)
+        if suppressed == self._target_visibility_suppressed:
+            return
+        self._target_visibility_suppressed = suppressed
+        self._coordinator_visibility_change = True
+        try:
+            if suppressed:
+                if self.isVisible():
+                    QWidget.hide(self)
+            elif self._ui_visibility_intent and not self.isVisible():
+                QWidget.show(self)
+                QTimer.singleShot(0, self._apply_native_no_activate)
+        finally:
+            self._coordinator_visibility_change = False
 
     def _on_script_selected(self, index):
         filename = self.combo.itemData(index)

@@ -12,6 +12,7 @@ WS_EX_NOACTIVATE = 0x08000000
 SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 WM_MOUSEACTIVATE = 0x0021
 MA_NOACTIVATE = 3
@@ -94,7 +95,13 @@ class WindowsNoActivateAdapter:
             style_requested=requested,
             previous_style=previous_style,
         )
-        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+        flags = (
+            SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOZORDER
+            | SWP_NOACTIVATE
+            | SWP_FRAMECHANGED
+        )
         self._observe(
             "NOACTIVATE_SETWINDOWPOS_BEGIN",
             hwnd=int(hwnd),
@@ -102,7 +109,7 @@ class WindowsNoActivateAdapter:
             style_before=current,
             style_requested=requested,
             setwindowpos_flags=flags,
-            contains_swp_noactivate=bool(flags & 0x0010),
+            contains_swp_noactivate=bool(flags & SWP_NOACTIVATE),
             contains_swp_nozorder=bool(flags & SWP_NOZORDER),
             contains_swp_framechanged=bool(flags & SWP_FRAMECHANGED),
         )
@@ -124,7 +131,7 @@ class WindowsNoActivateAdapter:
             style_before=current,
             style_requested=requested,
             setwindowpos_flags=flags,
-            contains_swp_noactivate=bool(flags & 0x0010),
+            contains_swp_noactivate=bool(flags & SWP_NOACTIVATE),
             contains_swp_nozorder=bool(flags & SWP_NOZORDER),
             contains_swp_framechanged=bool(flags & SWP_FRAMECHANGED),
             return_value=bool(result),

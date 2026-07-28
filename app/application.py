@@ -17,6 +17,7 @@ from app.settings import Settings
 from app.script_store import ScriptStore
 from app.window_tracker import WindowTracker
 from app.target_session import TargetConnectionState, TargetSessionService
+from app.target_relative_overlay import TargetRelativeOverlayCoordinator
 from app.input_safety import ForegroundInputSafetyGate, InputAuthorizationCode
 from app.recorder import ActionRecorder
 from app.player import ScriptPlayer
@@ -97,6 +98,12 @@ class ScreenBotApp:
             self.root_path,
             overlay_diagnostics=self.overlay_diagnostics,
         )
+        self.target_relative_overlay = TargetRelativeOverlayCoordinator(
+            self.target_session,
+            self.widget,
+            self.logger,
+        )
+        self.target_relative_overlay.start()
         if self.overlay_diagnostics is not None:
             self.target_session.subscribe(self._on_overlay_target_session_event)
             self.overlay_diagnostics.start()
@@ -280,9 +287,22 @@ class ScreenBotApp:
         try:
             info = self.window_tracker.lock_foreground_window()
             target_session = getattr(self, "target_session", None)
+            target_snapshot = (
+                target_session.get_snapshot()
+                if target_session is not None
+                else None
+            )
+            target_relative_overlay = getattr(
+                self, "target_relative_overlay", None
+            )
+            if (
+                target_relative_overlay is not None
+                and target_snapshot is not None
+            ):
+                target_relative_overlay.bind_snapshot(target_snapshot)
             self._record_overlay_target_event(
                 "TARGET_LOCK_SUCCEEDED",
-                target_session.get_snapshot() if target_session is not None else None,
+                target_snapshot,
             )
             self._invalidate_armed_start("target_relocked", unavailable=False)
             self.text_detector.invalidate_capture_target()
@@ -786,6 +806,9 @@ class ScreenBotApp:
         if self.player.is_active():
             self.player.stop()
         self.text_detector.close()
+        target_relative_overlay = getattr(self, "target_relative_overlay", None)
+        if target_relative_overlay is not None:
+            target_relative_overlay.close()
         target_session = getattr(self, "target_session", None)
         if target_session is not None:
             target_session.clear("application_shutdown")
