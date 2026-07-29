@@ -10,6 +10,8 @@ import time
 from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageStat
 import pytesseract
 
+from .ocr_process_policy import TesseractProcessPolicy
+
 
 _CJK_PATTERN = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 
@@ -17,11 +19,18 @@ _CJK_PATTERN = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 class OCRPipeline:
     """Recognize complete CJK lines while rejecting unsupported OCR noise."""
 
-    def __init__(self, logger=None, minimum_confidence=35, process_diagnostics=None):
+    def __init__(
+        self,
+        logger=None,
+        minimum_confidence=35,
+        process_diagnostics=None,
+        process_policy=None,
+    ):
         self.logger = logger or logging.getLogger("ScreenBot.OCRPipeline")
         self.minimum_confidence = minimum_confidence
         self._profile_cache = {}
         self._process_diagnostics = process_diagnostics
+        self._process_policy = process_policy or TesseractProcessPolicy()
 
     def set_process_diagnostics(self, diagnostics):
         """Attach the gated observer without changing OCR behavior."""
@@ -238,11 +247,10 @@ class OCRPipeline:
             scale=scale,
         )
         try:
-            data = pytesseract.image_to_data(
+            data = self._process_policy.image_to_data(
                 image,
                 lang=language,
                 config=f"--psm {psm}",
-                output_type=pytesseract.Output.DICT,
             )
         except Exception as exc:
             self._diagnostic_variant_finished(
@@ -829,7 +837,7 @@ class OCRPipeline:
             config="",
         )
         try:
-            installed = set(pytesseract.get_languages(config=""))
+            installed = set(self._process_policy.get_languages(config=""))
         except Exception as exc:
             self._diagnostic_variant_finished(
                 language_token,

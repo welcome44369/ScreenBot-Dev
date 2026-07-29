@@ -162,7 +162,6 @@ class OcrProcessDiagnosticsTests(unittest.TestCase):
 
     def test_pipeline_marks_language_query_and_each_existing_variant(self):
         observer = FakePipelineObserver()
-        pipeline = OCRPipeline(process_diagnostics=observer)
         empty_data = {
             "text": [],
             "conf": [],
@@ -174,15 +173,17 @@ class OcrProcessDiagnosticsTests(unittest.TestCase):
             "par_num": [],
             "line_num": [],
         }
-        with patch("app.ocr_pipeline.pytesseract.get_languages", return_value=["eng"]):
-            with patch(
-                "app.ocr_pipeline.pytesseract.image_to_data",
-                return_value=empty_data,
-            ):
-                pipeline.recognize_text(
-                    Image.new("RGB", (40, 20), "black"),
-                    languages="eng",
-                )
+        process_policy = unittest.mock.Mock()
+        process_policy.get_languages.return_value = ["eng"]
+        process_policy.image_to_data.return_value = empty_data
+        pipeline = OCRPipeline(
+            process_diagnostics=observer,
+            process_policy=process_policy,
+        )
+        pipeline.recognize_text(
+            Image.new("RGB", (40, 20), "black"),
+            languages="eng",
+        )
         variant_ids = [item[1] for item in observer.started]
         self.assertEqual(variant_ids[0], "get_languages")
         self.assertEqual(
