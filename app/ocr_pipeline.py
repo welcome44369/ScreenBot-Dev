@@ -17,10 +17,36 @@ _CJK_PATTERN = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
 class OCRPipeline:
     """Recognize complete CJK lines while rejecting unsupported OCR noise."""
 
-    def __init__(self, logger=None, minimum_confidence=35):
+    def __init__(self, logger=None, minimum_confidence=35, process_diagnostics=None):
         self.logger = logger or logging.getLogger("ScreenBot.OCRPipeline")
         self.minimum_confidence = minimum_confidence
         self._profile_cache = {}
+        self._process_diagnostics = process_diagnostics
+
+    def set_process_diagnostics(self, diagnostics):
+        """Attach the gated observer without changing OCR behavior."""
+        self._process_diagnostics = diagnostics
+
+    def _diagnostic_variant_started(self, variant_id, **metadata):
+        diagnostics = self._process_diagnostics
+        if diagnostics is None or not getattr(diagnostics, "active", False):
+            return None
+        try:
+            return diagnostics.variant_started(variant_id, **metadata)
+        except TimeoutError:
+            raise
+        except Exception:
+            self.logger.exception("OCR process diagnostic variant start failed")
+            return None
+
+    def _diagnostic_variant_finished(self, token, error=None):
+        diagnostics = self._process_diagnostics
+        if diagnostics is None or token is None:
+            return
+        try:
+            diagnostics.variant_finished(token, error=error)
+        except Exception:
+            self.logger.exception("OCR process diagnostic variant finish failed")
 
     @staticmethod
     def _normalize(value):
@@ -202,12 +228,30 @@ class OCRPipeline:
         label = f"{family}/{mode}/{language}/psm{psm}"
         self.logger.info("OCR_PIPELINE_START %s", label)
         started = time.perf_counter()
-        data = pytesseract.image_to_data(
-            image,
-            lang=language,
-            config=f"--psm {psm}",
-            output_type=pytesseract.Output.DICT,
+        diagnostic_token = self._diagnostic_variant_started(
+            label,
+            call="pytesseract.image_to_data",
+            family=family,
+            mode=mode,
+            language=language,
+            psm=psm,
+            scale=scale,
         )
+        try:
+            data = pytesseract.image_to_data(
+                image,
+                lang=language,
+                config=f"--psm {psm}",
+                output_type=pytesseract.Output.DICT,
+            )
+        except Exception as exc:
+            self._diagnostic_variant_finished(
+                diagnostic_token,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        else:
+            self._diagnostic_variant_finished(diagnostic_token)
         duration = int((time.perf_counter() - started) * 1000)
         entries = []
         raw_tokens = []
@@ -779,7 +823,21 @@ class OCRPipeline:
             )
 
     def recognize_text(self, image, languages="eng+chi_tra", layout_hint="multi_line"):
-        installed = set(pytesseract.get_languages(config=""))
+        language_token = self._diagnostic_variant_started(
+            "get_languages",
+            call="pytesseract.get_languages",
+            config="",
+        )
+        try:
+            installed = set(pytesseract.get_languages(config=""))
+        except Exception as exc:
+            self._diagnostic_variant_finished(
+                language_token,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        else:
+            self._diagnostic_variant_finished(language_token)
         if "eng" not in installed:
             raise RuntimeError(
                 "Tesseract English language data (eng) is not installed."

@@ -1,4 +1,6 @@
 ﻿from pathlib import Path
+import os
+
 from PySide6.QtCore import QEvent, QTimer, Qt, QPoint, Signal, QUrl
 from PySide6.QtGui import QAction, QCursor, QColor
 from PySide6.QtWidgets import (
@@ -70,6 +72,7 @@ class FloatingWidget(QWidget):
     compact_hwnd_changed = Signal(int, int)
     compact_geometry_changed = Signal()
     compact_visibility_intent_changed = Signal(bool)
+    run_ocr_process_probe = Signal()
 
     def __init__(self, root_path, native_no_activate_adapter=None, overlay_diagnostics=None):
         super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.Tool)
@@ -83,6 +86,9 @@ class FloatingWidget(QWidget):
         self._ui_visibility_intent = True
         self._coordinator_visibility_change = False
         self._target_visibility_suppressed = False
+        self._ocr_process_diagnostic_enabled = (
+            os.environ.get("SCREENBOT_OCR_PROCESS_DIAGNOSTIC") == "1"
+        )
         self.drag_position = None
         self.drag_started = False
         self.expanded = False
@@ -344,6 +350,12 @@ class FloatingWidget(QWidget):
         self.workflow_debug_button.setFocusPolicy(Qt.NoFocus)
         self.workflow_debug_button.setFixedHeight(26)
         button_row3.addWidget(self.workflow_debug_button)
+        self.ocr_process_probe_button = None
+        if self._ocr_process_diagnostic_enabled:
+            self.ocr_process_probe_button = QPushButton("Run OCR Probe")
+            self.ocr_process_probe_button.setFocusPolicy(Qt.NoFocus)
+            self.ocr_process_probe_button.setFixedHeight(26)
+            button_row3.addWidget(self.ocr_process_probe_button)
         button_row3.addStretch()
         self.details_layout.addLayout(button_row3)
 
@@ -360,6 +372,10 @@ class FloatingWidget(QWidget):
         self.open_runtime_log_folder_button.clicked.connect(lambda: self.open_runtime_log_folder.emit())
         self.workflow_editor_button.clicked.connect(lambda: self.open_workflow_editor.emit())
         self.workflow_debug_button.clicked.connect(lambda: self.open_runtime_debug_panel.emit())
+        if self.ocr_process_probe_button is not None:
+            self.ocr_process_probe_button.clicked.connect(
+                lambda: self.run_ocr_process_probe.emit()
+            )
         self.trigger_action_button.clicked.connect(lambda: self.open_trigger_manager.emit())
         self.macro_action_button.clicked.connect(lambda: self.open_macro_manager.emit())
         self.workflow_action_button.clicked.connect(lambda: self.open_workflow_manager.emit())
@@ -560,6 +576,22 @@ class FloatingWidget(QWidget):
         self.start_workflow_button.setEnabled(not running)
         self.refresh_workflow_button.setEnabled(not running)
         self.stop_workflow_button.setEnabled(running)
+
+    def set_ocr_process_probe_state(
+        self, running=False, message=None, completed=False
+    ):
+        button = self.ocr_process_probe_button
+        if button is None:
+            return
+        button.setEnabled(not running and not completed)
+        if running:
+            button.setText("OCR Probe Running…")
+        elif completed:
+            button.setText("OCR Probe Complete")
+        else:
+            button.setText("Run OCR Probe")
+        if message:
+            button.setToolTip(str(message))
 
     def set_start_handoff_presentation(self, snapshot):
         """Render the application-owned handoff state without owning its logic."""

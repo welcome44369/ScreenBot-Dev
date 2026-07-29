@@ -3,6 +3,7 @@ import logging
 import ctypes
 import copy
 import os
+import threading
 import time
 from pathlib import Path
 from datetime import datetime
@@ -50,6 +51,11 @@ class RecorderOverlayBridge(QObject):
     ripple_requested = Signal(dict)
 
 
+class OcrProcessProbeBridge(QObject):
+    completed = Signal(dict)
+    failed = Signal(str)
+
+
 class ScreenBotApp:
     def __init__(self, root_path):
         self.root_path = Path(root_path)
@@ -63,11 +69,22 @@ class ScreenBotApp:
         self.target_session = TargetSessionService(self.window_tracker, self.logger)
         self.window_tracker.attach_target_session(self.target_session)
         self.input_safety_gate = ForegroundInputSafetyGate(self.target_session, self.window_tracker, self.logger)
+        self.ocr_process_diagnostics = None
+        if os.environ.get("SCREENBOT_OCR_PROCESS_DIAGNOSTIC") == "1":
+            from app.ocr_process_diagnostics import OcrProcessDiagnostics
+
+            self.ocr_process_diagnostics = OcrProcessDiagnostics(
+                self.root_path,
+                self.logger,
+            )
         self.text_detector = TextDetector(
             self.window_tracker,
             self.logger,
             tesseract_cmd=self._resolve_tesseract_cmd(),
             lang=self.settings.get("ocr_lang", "eng+chi_tra"),
+        )
+        self.text_detector.ocr_pipeline.set_process_diagnostics(
+            self.ocr_process_diagnostics
         )
         self.trigger_runner = None
         self.player = ScriptPlayer(self.window_tracker, input_safety_gate=self.input_safety_gate)
@@ -125,6 +142,17 @@ class ScreenBotApp:
         self.widget.open_trigger_manager.connect(self.open_trigger_manager)
         self.widget.open_macro_manager.connect(self.open_macro_manager)
         self.widget.open_workflow_manager.connect(self.open_workflow_manager)
+        self.ocr_process_probe_bridge = OcrProcessProbeBridge()
+        self.ocr_process_probe_bridge.completed.connect(
+            self._on_ocr_process_probe_completed
+        )
+        self.ocr_process_probe_bridge.failed.connect(
+            self._on_ocr_process_probe_failed
+        )
+        if self.ocr_process_diagnostics is not None:
+            self.widget.run_ocr_process_probe.connect(
+                self._run_ocr_process_probe
+            )
 
         self.recorder_overlay = RecorderOverlayController(self.window_tracker, self.logger)
         self.recorder_overlay_bridge = RecorderOverlayBridge()
@@ -784,6 +812,114 @@ class ScreenBotApp:
         path = self.script_store.scripts_dir
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
+    def _ocr_probe_idle_blocker(self):
+        if self.workflow_runner.is_active():
+            return "Workflow is active"
+        if self.player.is_active():
+            return "Player is active"
+        if self.trigger_runner is not None and self.trigger_runner.is_active():
+            return "TriggerRunner is active"
+        if self.state != AppState.IDLE:
+            return f"Application state is {self.state.name}"
+        if self.countdown_timer.isActive():
+            return "Countdown is active"
+        handoff = self.start_handoff.get_snapshot()
+        if handoff.state in {
+            StartHandoffState.ARMED,
+            StartHandoffState.COMMITTING,
+        }:
+            return f"Start handoff is {handoff.state.value}"
+        return None
+
+    def _run_ocr_process_probe(self):
+        """Run one direct capture/OCR observation with no runtime execution."""
+        diagnostics = self.ocr_process_diagnostics
+        if diagnostics is None or not diagnostics.enabled:
+            return
+        blocker = self._ocr_probe_idle_blocker()
+        if blocker:
+            self.logger.warning("OCR process probe rejected: %s", blocker)
+            self.widget.set_ocr_process_probe_state(False, blocker)
+            return
+        if diagnostics.active:
+            self.widget.set_ocr_process_probe_state(
+                True, "An OCR process probe is already running"
+            )
+            return
+        snapshot = self.target_session.refresh()
+        if (
+            snapshot is None
+            or snapshot.connection_state != TargetConnectionState.ATTACHED
+            or not snapshot.identity_valid
+        ):
+            message = "Lock a valid external target with F8 before running the probe"
+            self.logger.warning("OCR process probe rejected: %s", message)
+            self.widget.set_ocr_process_probe_state(False, message)
+            return
+
+        expected_session_id = snapshot.session_id
+        expected_generation = snapshot.generation
+        target_hwnd = int(snapshot.hwnd)
+        compact_hwnd = int(self.widget.winId())
+        self.widget.set_ocr_process_probe_state(True, "One OCR observation is running")
+
+        def one_observation():
+            current = self.target_session.refresh()
+            if (
+                current is None
+                or current.session_id != expected_session_id
+                or current.generation != expected_generation
+                or current.connection_state != TargetConnectionState.ATTACHED
+                or not current.identity_valid
+            ):
+                raise RuntimeError("Locked target changed before the OCR probe")
+            image = self.text_detector.capture_client_image(
+                target_hwnd,
+                allow_desktop_fallback=False,
+            )
+            return self.text_detector.recognize_image(
+                image,
+                layout_hint="multi_line",
+            )
+
+        def worker():
+            try:
+                result = diagnostics.run_probe(
+                    one_observation,
+                    target_snapshot=snapshot,
+                    compact_hwnd=compact_hwnd,
+                )
+            except Exception as exc:
+                self.logger.exception("OCR process probe failed")
+                self.ocr_process_probe_bridge.failed.emit(
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                self.ocr_process_probe_bridge.completed.emit(result)
+
+        self._ocr_probe_thread = threading.Thread(
+            target=worker,
+            name="ScreenBotOcrOneShotProbe",
+            daemon=True,
+        )
+        self._ocr_probe_thread.start()
+
+    def _on_ocr_process_probe_completed(self, result):
+        message = (
+            f"Probe complete: variants={result.get('variant_count')} "
+            f"log={result.get('jsonl')}"
+        )
+        self.logger.info("OCR_PROCESS_PROBE_COMPLETED %s", message)
+        self.widget.set_ocr_process_probe_state(
+            False, message, completed=True
+        )
+
+    def _on_ocr_process_probe_failed(self, message):
+        self.logger.error("OCR_PROCESS_PROBE_FAILED %s", message)
+        self.widget.set_ocr_process_probe_state(
+            False, message, completed=True
+        )
+
     def confirm_exit(self):
         result = ask_confirmation(self.widget, "確認退出", "確定要退出 ScreenBot 嗎？")
         if result == QMessageBox.Yes:
@@ -822,6 +958,8 @@ class ScreenBotApp:
         self.widget.close()
         if self.overlay_diagnostics is not None:
             self.overlay_diagnostics.close()
+        if self.ocr_process_diagnostics is not None:
+            self.ocr_process_diagnostics.close()
         self.app.quit()
 
     def configure_text_trigger(self, trigger_data):
