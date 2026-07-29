@@ -32,6 +32,7 @@ WS_VISIBLE = 0x10000000
 WS_EX_TOPMOST = 0x00000008
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
+WS_EX_LAYERED = 0x00080000
 WS_EX_NOACTIVATE = 0x08000000
 DWMWA_CLOAKED = 14
 WINEVENT_OUTOFCONTEXT = 0x0000
@@ -277,21 +278,79 @@ class OverlayDiagnosticWin32Adapter:
         now_wall = datetime.now(timezone.utc).astimezone().isoformat()
         hwnd = int(hwnd or 0)
         if not self.user32 or not hwnd:
-            style_flags = parse_window_styles(style, exstyle)
             return WindowIdentitySnapshot(
-                now_monotonic, now_wall, hwnd, False, None, None, None, None,
-                None, None, 0, 0, 0, 0, 0, 0, False, False, False, False,
-                False, False, False, False, None, None, 0, 0, 0, 0, 0, False,
+                timestamp_monotonic=now_monotonic,
+                timestamp_wall=now_wall,
+                hwnd=hwnd,
+                is_window=False,
+                pid=None,
+                thread_id=None,
+                process_name=None,
+                executable=None,
+                title=None,
+                class_name=None,
+                root_hwnd=0,
+                root_owner_hwnd=0,
+                parent_hwnd=0,
+                owner_hwnd=0,
+                window_style_raw=0,
+                extended_style_raw=0,
+                is_topmost=False,
+                is_noactivate=False,
+                is_toolwindow=False,
+                is_appwindow=False,
+                is_child=False,
+                is_visible=False,
+                is_enabled=False,
+                is_iconic=False,
+                is_cloaked=None,
+                window_rect=None,
+                client_rect_screen=None,
+                dpi=0,
+                z_prev_hwnd=0,
+                z_next_hwnd=0,
+                foreground_hwnd=0,
+                foreground_root_hwnd=0,
+                is_foreground=False,
             )
 
         exists = bool(self.user32.IsWindow(wintypes.HWND(hwnd)))
         foreground = self.foreground_hwnd()
         if not exists:
             return WindowIdentitySnapshot(
-                now_monotonic, now_wall, hwnd, False, None, None, None, None,
-                None, None, 0, 0, 0, 0, 0, 0, False, False, False, False,
-                False, False, False, False, None, None, 0, 0, 0, foreground,
-                self.root_hwnd(foreground), False,
+                timestamp_monotonic=now_monotonic,
+                timestamp_wall=now_wall,
+                hwnd=hwnd,
+                is_window=False,
+                pid=None,
+                thread_id=None,
+                process_name=None,
+                executable=None,
+                title=None,
+                class_name=None,
+                root_hwnd=0,
+                root_owner_hwnd=0,
+                parent_hwnd=0,
+                owner_hwnd=0,
+                window_style_raw=0,
+                extended_style_raw=0,
+                is_topmost=False,
+                is_noactivate=False,
+                is_toolwindow=False,
+                is_appwindow=False,
+                is_child=False,
+                is_visible=False,
+                is_enabled=False,
+                is_iconic=False,
+                is_cloaked=None,
+                window_rect=None,
+                client_rect_screen=None,
+                dpi=0,
+                z_prev_hwnd=0,
+                z_next_hwnd=0,
+                foreground_hwnd=foreground,
+                foreground_root_hwnd=self.root_hwnd(foreground),
+                is_foreground=False,
             )
 
         pid = wintypes.DWORD()
@@ -577,7 +636,15 @@ class OverlayDiagnostics(QObject):
     def capture_window(self, hwnd):
         try:
             snapshot = self.adapter.snapshot_window(int(hwnd or 0))
-            return snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot)
+            data = (
+                snapshot.to_dict()
+                if hasattr(snapshot, "to_dict")
+                else dict(snapshot)
+            )
+            data["is_layered"] = bool(
+                int(data.get("extended_style_raw", 0)) & WS_EX_LAYERED
+            )
+            return data
         except Exception as exc:
             self._failure("WINDOW_SNAPSHOT_FAILED", exc)
             return {"hwnd": int(hwnd or 0), "snapshot_error": type(exc).__name__}
@@ -748,6 +815,135 @@ class OverlayDiagnostics(QObject):
         )
         self.capture_z_order_snapshot(event)
 
+    def observe_coordinator_reconcile(
+        self,
+        phase,
+        *,
+        reason,
+        session_id,
+        generation,
+        overlay_hwnd,
+        target_hwnd,
+        binding_valid,
+        target_suppressed,
+        user_visibility_intent,
+        effective_visibility,
+        computed_predecessor=None,
+        already_settled=None,
+        set_window_pos_action=None,
+        skip_reason=None,
+        widget=None,
+    ):
+        """Record a coordinator decision without changing that decision."""
+        if not self.enabled:
+            return
+        foreground = self.adapter.foreground_hwnd()
+        overlay = self.capture_window(overlay_hwnd)
+        target = self.capture_window(target_hwnd)
+        qt_data = {}
+        if widget is not None:
+            try:
+                qt_data = {
+                    "qt_window_flags": int(widget.windowFlags()),
+                    "qt_visible": bool(widget.isVisible()),
+                    "qt_wa_show_without_activating": bool(
+                        widget.testAttribute(98)
+                    ),
+                }
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                qt_data = {"qt_snapshot_error": True}
+        self.record_event(
+            "COORDINATOR_RECONCILE",
+            phase=str(phase),
+            reason=str(reason),
+            thread_id=int(__import__("threading").get_ident()),
+            session_id=session_id,
+            generation=generation,
+            binding_valid=bool(binding_valid),
+            target_suppressed=bool(target_suppressed),
+            user_visibility_intent=bool(user_visibility_intent),
+            effective_visibility=effective_visibility,
+            overlay_hwnd=int(overlay_hwnd or 0),
+            overlay_root_hwnd=overlay.get("root_hwnd"),
+            target_root_hwnd=target.get("root_hwnd"),
+            foreground_hwnd=foreground,
+            foreground_root_hwnd=self.adapter.root_hwnd(foreground),
+            target_topmost=target.get("is_topmost"),
+            overlay_topmost=overlay.get("is_topmost"),
+            computed_predecessor=computed_predecessor,
+            computed_successor=overlay.get("z_next_hwnd"),
+            already_settled=already_settled,
+            set_window_pos_action=set_window_pos_action,
+            skip_reason=skip_reason,
+            **qt_data,
+        )
+        self.capture_z_order_snapshot(f"COORDINATOR_{phase}_{reason}")
+
+    def observe_set_window_pos(
+        self,
+        phase,
+        *,
+        reason,
+        hwnd,
+        insert_after,
+        x,
+        y,
+        width,
+        height,
+        flags,
+        result=None,
+        last_error=None,
+    ):
+        """Capture exact native mutation arguments and surrounding state."""
+        if not self.enabled:
+            return
+        foreground = self.adapter.foreground_hwnd()
+        self.record_event(
+            "SET_WINDOW_POS",
+            phase=str(phase),
+            reason=str(reason),
+            thread_id=int(__import__("threading").get_ident()),
+            overlay_hwnd=int(hwnd or 0),
+            insert_after_raw=int(insert_after),
+            insert_after_symbolic=self.decode_hwnd_insert_after(insert_after),
+            x=int(x),
+            y=int(y),
+            width=int(width),
+            height=int(height),
+            flags_raw=int(flags),
+            flags_decoded=self.decode_swp_flags(flags),
+            result=result,
+            get_last_error=last_error,
+            foreground_hwnd=foreground,
+            foreground_root_hwnd=self.adapter.root_hwnd(foreground),
+            overlay_window=self.capture_window(hwnd),
+        )
+        self.capture_z_order_snapshot(f"SET_WINDOW_POS_{phase}_{reason}")
+
+    @staticmethod
+    def decode_hwnd_insert_after(value):
+        return {
+            0: "HWND_TOP",
+            1: "HWND_BOTTOM",
+            -1: "HWND_TOPMOST",
+            -2: "HWND_NOTOPMOST",
+        }.get(int(value), f"HWND({int(value)})")
+
+    @staticmethod
+    def decode_swp_flags(flags):
+        flags = int(flags)
+        names = (
+            (0x0001, "SWP_NOSIZE"),
+            (0x0002, "SWP_NOMOVE"),
+            (0x0004, "SWP_NOZORDER"),
+            (0x0010, "SWP_NOACTIVATE"),
+            (0x0040, "SWP_SHOWWINDOW"),
+            (0x0080, "SWP_HIDEWINDOW"),
+            (0x0200, "SWP_NOOWNERZORDER"),
+            (0x0400, "SWP_NOSENDCHANGING"),
+        )
+        return [name for bit, name in names if flags & bit]
+
     def capture_z_order_snapshot(self, reason):
         if not self.enabled:
             return
@@ -766,13 +962,21 @@ class OverlayDiagnostics(QObject):
                 target_neighbors=self._neighbors(snapshots, target_index),
                 top_to_bottom=[
                     {
+                        "z_index": index,
                         "hwnd": item.get("hwnd"),
+                        "root_hwnd": item.get("root_hwnd"),
                         "role": self.classify_window(item),
+                        "pid": item.get("pid"),
                         "process_name": item.get("process_name"),
+                        "class_name": item.get("class_name"),
                         "title": item.get("title"),
+                        "visible": item.get("is_visible"),
+                        "iconic": item.get("is_iconic"),
                         "topmost": item.get("is_topmost"),
+                        "owner_hwnd": item.get("owner_hwnd"),
+                        "root_owner_hwnd": item.get("root_owner_hwnd"),
                     }
-                    for item in snapshots
+                    for index, item in enumerate(snapshots)
                 ],
             )
         except Exception as exc:

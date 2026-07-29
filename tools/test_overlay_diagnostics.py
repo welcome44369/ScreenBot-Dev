@@ -17,6 +17,7 @@ from app.overlay_diagnostics import (
     EVENT_SYSTEM_FOREGROUND,
     OverlayDiagnostics,
     WS_CHILD,
+    WS_EX_LAYERED,
     WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST,
@@ -161,6 +162,77 @@ class OverlayDiagnosticsTests(unittest.TestCase):
             snapshot = next(record for record in records if record["event"] == "Z_ORDER_SNAPSHOT" and record["reason"] == "test")
             self.assertEqual([item["hwnd"] for item in snapshot["top_to_bottom"]], [30, 10, 20])
             self.assertEqual(snapshot["compact_neighbors"]["below"][0]["hwnd"], 20)
+            self.assertEqual(snapshot["top_to_bottom"][0]["z_index"], 0)
+            self.assertEqual(snapshot["top_to_bottom"][0]["owner_hwnd"], 0)
+
+    def test_layered_style_and_special_native_values_are_decoded(self):
+        adapter = _FakeAdapter()
+        adapter.windows[10]["extended_style_raw"] |= WS_EX_LAYERED
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics = OverlayDiagnostics(
+                directory, adapter=adapter, enabled=True
+            )
+            self.assertTrue(diagnostics.capture_window(10)["is_layered"])
+            diagnostics.close()
+        self.assertEqual(
+            OverlayDiagnostics.decode_hwnd_insert_after(-2),
+            "HWND_NOTOPMOST",
+        )
+        self.assertEqual(
+            OverlayDiagnostics.decode_hwnd_insert_after(30),
+            "HWND(30)",
+        )
+        self.assertEqual(
+            OverlayDiagnostics.decode_swp_flags(0x0010 | 0x0001 | 0x0002),
+            ["SWP_NOSIZE", "SWP_NOMOVE", "SWP_NOACTIVATE"],
+        )
+
+    def test_setwindowpos_observation_is_read_only(self):
+        adapter = _FakeAdapter()
+        original_order = list(adapter.enumerate_windows())
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics = OverlayDiagnostics(
+                directory, adapter=adapter, enabled=True
+            )
+            diagnostics.observe_compact_lifecycle(
+                "COMPACT_WINID_FIRST_ACQUIRED", old_hwnd=0, new_hwnd=10
+            )
+            diagnostics.observe_set_window_pos(
+                "before",
+                reason="z_order",
+                hwnd=10,
+                insert_after=30,
+                x=0,
+                y=0,
+                width=0,
+                height=0,
+                flags=0x0010 | 0x0001 | 0x0002,
+            )
+            diagnostics.observe_set_window_pos(
+                "after",
+                reason="z_order",
+                hwnd=10,
+                insert_after=30,
+                x=0,
+                y=0,
+                width=0,
+                height=0,
+                flags=0x0010 | 0x0001 | 0x0002,
+                result=True,
+                last_error=0,
+            )
+            records = self._read_records(diagnostics)
+
+        mutations = [
+            item for item in records if item["event"] == "SET_WINDOW_POS"
+        ]
+        self.assertEqual(
+            [item["phase"] for item in mutations],
+            ["before", "after"],
+        )
+        self.assertEqual(mutations[-1]["insert_after_symbolic"], "HWND(30)")
+        self.assertEqual(mutations[-1]["get_last_error"], 0)
+        self.assertEqual(adapter.enumerate_windows(), original_order)
 
     def test_start_correlation_lifecycle_popup_and_event_sampling(self):
         adapter = _FakeAdapter()

@@ -263,6 +263,9 @@ class TargetRelativeOverlayCoordinator(QObject):
         self._native_minimized = False
         self._native_hidden = False
         self._effective_visible = None
+        self._pending_reconcile_reason = None
+        self._active_reconcile_reason = "unspecified"
+        self._diagnostics = getattr(widget, "_overlay_diagnostics", None)
         visibility_intent = getattr(widget, "is_compact_visibility_intended", None)
         self._ui_wants_visible = (
             bool(visibility_intent()) if callable(visibility_intent) else True
@@ -353,7 +356,7 @@ class TargetRelativeOverlayCoordinator(QObject):
             self._native_hidden = not self.adapter.is_visible(snapshot.root_hwnd)
             self._effective_visible = None
             self._offset = self._capture_offset(snapshot)
-        self.request_reconcile(snapshot.generation)
+        self.request_reconcile(snapshot.generation, reason="target_bind")
 
     def detach(self, hide=True):
         if hide:
@@ -372,7 +375,9 @@ class TargetRelativeOverlayCoordinator(QObject):
         self._ensure_overlay_non_topmost()
         if self._snapshot is not None:
             self._offset = self._capture_offset(self._snapshot)
-            self.request_reconcile(self._snapshot.generation)
+            self.request_reconcile(
+                self._snapshot.generation, reason="compact_hwnd_changed"
+            )
 
     def on_compact_geometry_changed(self):
         if self._snapshot is not None:
@@ -385,7 +390,9 @@ class TargetRelativeOverlayCoordinator(QObject):
         if not self._ui_wants_visible:
             self._set_effective_visible(False)
         if self._snapshot is not None:
-            self.request_reconcile(self._snapshot.generation)
+            self.request_reconcile(
+                self._snapshot.generation, reason="visibility_intent"
+            )
 
     def _on_target_event(self, event, snapshot, _payload):
         if event in {"TARGET_SESSION_CLEARED", "TARGET_DISCONNECTED"}:
@@ -397,7 +404,9 @@ class TargetRelativeOverlayCoordinator(QObject):
         if self._is_current_binding(snapshot):
             self._snapshot = snapshot
             if event != "TARGET_SNAPSHOT_UPDATED":
-                self.request_reconcile(snapshot.generation)
+                self.request_reconcile(
+                    snapshot.generation, reason=f"target_event:{event}"
+                )
             return
         self.bind_snapshot(snapshot)
 
@@ -426,48 +435,62 @@ class TargetRelativeOverlayCoordinator(QObject):
         if event == EVENT_SYSTEM_MINIMIZESTART and targets_current_root:
             self._native_minimized = True
             self._set_effective_visible(False)
-            self.request_reconcile(self._binding[1])
+            self.request_reconcile(
+                self._binding[1], reason="winevent:minimize_start"
+            )
             return
         if event == EVENT_SYSTEM_MINIMIZEEND and targets_current_root:
             self._native_minimized = False
-            self.request_reconcile(self._binding[1])
+            self.request_reconcile(
+                self._binding[1], reason="winevent:minimize_end"
+            )
             return
         if event == EVENT_OBJECT_HIDE and targets_current_root:
             self._native_hidden = True
             self._set_effective_visible(False)
-            self.request_reconcile(self._binding[1])
+            self.request_reconcile(
+                self._binding[1], reason="winevent:hide"
+            )
             return
         if event == EVENT_OBJECT_SHOW and targets_current_root:
             self._native_hidden = False
-            self.request_reconcile(self._binding[1])
+            self.request_reconcile(
+                self._binding[1], reason="winevent:show"
+            )
             return
         if event == EVENT_SYSTEM_FOREGROUND or hwnd in {
             0,
             target_hwnd,
             self._overlay_hwnd,
         } or targets_current_root:
-            self.request_reconcile(self._binding[1])
+            self.request_reconcile(
+                self._binding[1], reason=f"winevent:{event:#x}"
+            )
 
-    def request_reconcile(self, generation=None):
+    def request_reconcile(self, generation=None, reason="request"):
         if self._closed or self._binding is None:
             return
         if generation is not None and int(generation) != self._binding[1]:
             return
         self._pending_generation = self._binding[1]
+        self._pending_reconcile_reason = str(reason)
         if not self._debounce_timer.isActive():
             self._debounce_timer.start()
 
     def _run_debounced(self):
         generation = self._pending_generation
+        reason = self._pending_reconcile_reason or "debounce"
         self._pending_generation = None
+        self._pending_reconcile_reason = None
         if self._binding is not None and generation == self._binding[1]:
-            self.reconcile(generation)
+            self.reconcile(generation, reason=reason)
 
     def _on_healing_tick(self):
         if self._binding is not None:
-            self.reconcile(self._binding[1])
+            self.reconcile(self._binding[1], reason="healing_timer")
 
-    def reconcile(self, generation=None):
+    def reconcile(self, generation=None, reason="direct"):
+        self._active_reconcile_reason = str(reason)
         if self._closed or self._binding is None:
             return False
         if generation is not None and int(generation) != self._binding[1]:
@@ -492,8 +515,16 @@ class TargetRelativeOverlayCoordinator(QObject):
             and snapshot.visibility_state != TargetVisibilityState.HIDDEN
         ):
             self._native_hidden = False
-        if self._must_suppress(snapshot):
+        suppressed = self._must_suppress(snapshot)
+        self._observe_reconcile("before", snapshot, suppressed=suppressed)
+        if suppressed:
             self._set_effective_visible(False)
+            self._observe_reconcile(
+                "after",
+                snapshot,
+                suppressed=True,
+                skip_reason="target_suppressed",
+            )
             return False
         if not self.adapter.is_window(self._overlay_hwnd):
             self._overlay_hwnd = int(self.widget.winId() or 0)
@@ -506,9 +537,16 @@ class TargetRelativeOverlayCoordinator(QObject):
         self._ensure_overlay_non_topmost()
         self._set_effective_visible(self._ui_wants_visible)
         if not self._ui_wants_visible:
+            self._observe_reconcile(
+                "after",
+                snapshot,
+                suppressed=False,
+                skip_reason="user_visibility_intent_false",
+            )
             return True
         self._apply_geometry(snapshot)
         self._apply_z_order(snapshot)
+        self._observe_reconcile("after", snapshot, suppressed=False)
         return True
 
     def _capture_offset(self, snapshot):
@@ -535,8 +573,15 @@ class TargetRelativeOverlayCoordinator(QObject):
             | SWP_NOOWNERZORDER
             | SWP_NOSENDCHANGING
         )
-        return self.adapter.set_window_pos(
-            self._overlay_hwnd, HWND_TOP, x, y, width, height, flags
+        return self._set_window_pos(
+            "geometry",
+            self._overlay_hwnd,
+            HWND_TOP,
+            x,
+            y,
+            width,
+            height,
+            flags,
         )
 
     def _apply_z_order(self, snapshot):
@@ -559,10 +604,37 @@ class TargetRelativeOverlayCoordinator(QObject):
         except ValueError:
             target_index = -1
         if target_index > 0 and order[target_index - 1] == self._overlay_hwnd:
+            self._observe_reconcile(
+                "decision",
+                snapshot,
+                suppressed=False,
+                computed_predecessor=(
+                    order[target_index - 2]
+                    if target_index > 1
+                    else HWND_TOP
+                ),
+                already_settled=True,
+                skip_reason="overlay_directly_above_target",
+            )
             return True
         insert_after = self._z_insert_after(snapshot)
-        return self.adapter.set_window_pos(
-            self._overlay_hwnd, insert_after, 0, 0, 0, 0, base_flags
+        self._observe_reconcile(
+            "decision",
+            snapshot,
+            suppressed=False,
+            computed_predecessor=insert_after,
+            already_settled=False,
+            set_window_pos_action="execute",
+        )
+        return self._set_window_pos(
+            "z_order",
+            self._overlay_hwnd,
+            insert_after,
+            0,
+            0,
+            0,
+            0,
+            base_flags,
         )
 
     def _z_insert_after(self, snapshot):
@@ -591,10 +663,93 @@ class TargetRelativeOverlayCoordinator(QObject):
             | SWP_NOOWNERZORDER
             | SWP_NOSENDCHANGING
         )
-        self.adapter.set_window_pos(
-            self._overlay_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags
+        self._set_window_pos(
+            "clear_topmost",
+            self._overlay_hwnd,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            flags,
         )
         return not self.adapter.is_topmost(self._overlay_hwnd)
+
+    def _set_window_pos(
+        self, reason, hwnd, insert_after, x, y, width, height, flags
+    ):
+        diagnostics = self._diagnostics
+        observer = getattr(diagnostics, "observe_set_window_pos", None)
+        enabled = bool(
+            callable(observer) and getattr(diagnostics, "enabled", False)
+        )
+        if enabled:
+            observer(
+                "before",
+                reason=reason,
+                hwnd=hwnd,
+                insert_after=insert_after,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                flags=flags,
+            )
+        result = self.adapter.set_window_pos(
+            hwnd, insert_after, x, y, width, height, flags
+        )
+        if enabled:
+            observer(
+                "after",
+                reason=reason,
+                hwnd=hwnd,
+                insert_after=insert_after,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                flags=flags,
+                result=bool(result),
+                last_error=ctypes.get_last_error(),
+            )
+        return result
+
+    def _observe_reconcile(
+        self,
+        phase,
+        snapshot,
+        *,
+        suppressed,
+        computed_predecessor=None,
+        already_settled=None,
+        set_window_pos_action=None,
+        skip_reason=None,
+    ):
+        diagnostics = self._diagnostics
+        observer = getattr(diagnostics, "observe_coordinator_reconcile", None)
+        if not (
+            callable(observer)
+            and getattr(diagnostics, "enabled", False)
+            and snapshot is not None
+        ):
+            return
+        observer(
+            phase,
+            reason=self._active_reconcile_reason,
+            session_id=getattr(snapshot, "session_id", None),
+            generation=getattr(snapshot, "generation", None),
+            overlay_hwnd=self._overlay_hwnd,
+            target_hwnd=getattr(snapshot, "root_hwnd", 0),
+            binding_valid=self._is_current_binding(snapshot),
+            target_suppressed=suppressed,
+            user_visibility_intent=self._ui_wants_visible,
+            effective_visibility=self._effective_visible,
+            computed_predecessor=computed_predecessor,
+            already_settled=already_settled,
+            set_window_pos_action=set_window_pos_action,
+            skip_reason=skip_reason,
+            widget=self.widget,
+        )
 
     def _set_effective_visible(self, visible):
         visible = bool(visible)
