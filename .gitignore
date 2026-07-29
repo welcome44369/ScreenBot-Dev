@@ -11,17 +11,30 @@ dist/
 *.spec.bak
 
 # Runtime-only/user diagnostic data
-logs/
 ocr-corrections/
-save/
-workflows/
-triggers/
-scripts/
-config/settings.json
 *.log
 *.jsonl
 *.tmp
 *.dmp
+
+# Local configuration
+/config/settings.json
+
+# User runtime data — keep directory documentation only
+/workflows/*
+!/workflows/README.md
+
+/triggers/*
+!/triggers/README.md
+
+/scripts/*
+!/scripts/README.md
+
+/logs/*
+!/logs/README.md
+
+/save/*
+!/save/README.md
 
 # Local editor and operating-system files
 .vscode/
