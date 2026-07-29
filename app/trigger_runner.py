@@ -22,6 +22,7 @@ class TriggerRunner:
         expected_target_session=None,
         input_safety_gate=None,
         on_input_blocked=None,
+        workflow_process_diagnostics=None,
     ):
         self.text_detector = text_detector
         self.script_store = script_store
@@ -44,6 +45,7 @@ class TriggerRunner:
         self._expected_target_session = expected_target_session
         self._input_safety_gate = input_safety_gate
         self._on_input_blocked = on_input_blocked
+        self._workflow_process_diagnostics = workflow_process_diagnostics
         self._input_suspended = False
         self._input_blocked_reason = None
         self._last_authorization = None
@@ -160,6 +162,18 @@ class TriggerRunner:
                     self._last_ocr_success_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     self._consecutive_success += 1
                     self._consecutive_failure = 0
+                if self._workflow_process_diagnostics is not None:
+                    quarantined = (
+                        self._workflow_process_diagnostics.observation_completed(
+                            observation=observation,
+                            result=result,
+                            step_id=self.trigger_data.get("name"),
+                        )
+                    )
+                    if quarantined:
+                        self._stop_event.set()
+                        self._publish_status()
+                        break
                 if result.triggered:
                     if callable(self._can_start_macro) and not self._can_start_macro():
                         self.logger.info("Text trigger matched but macro start was blocked by workflow stop")

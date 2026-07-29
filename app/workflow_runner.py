@@ -25,11 +25,20 @@ class WorkflowState(Enum):
 
 
 class WorkflowRunner:
-    def __init__(self, text_detector, script_store, player, logger=None, input_safety_gate=None):
+    def __init__(
+        self,
+        text_detector,
+        script_store,
+        player,
+        logger=None,
+        input_safety_gate=None,
+        workflow_process_diagnostics=None,
+    ):
         self.text_detector = text_detector
         self.script_store = script_store
         self.player = player
         self.input_safety_gate = input_safety_gate
+        self.workflow_process_diagnostics = workflow_process_diagnostics
         self._expected_target_session = None
         self.logger = logger or logging.getLogger("ScreenBot")
 
@@ -187,6 +196,11 @@ class WorkflowRunner:
         self.last_step_start_error = None
 
         self._thread = threading.Thread(target=self._run, daemon=True)
+        if self.workflow_process_diagnostics is not None:
+            self.workflow_process_diagnostics.stage(
+                "WORKFLOW_RUNNER_THREAD_STARTING",
+                cycle=self.current_cycle,
+            )
         self._thread.start()
 
     def request_immediate_stop(self, source, details=None):
@@ -335,6 +349,15 @@ class WorkflowRunner:
                     self.finish_reason = "manual_stop" if self.stopped_by_user else "workflow_stopped"
             # Run-scoped latches never survive a terminal workflow boundary.
             self._condition_memory.clear()
+            if self.workflow_process_diagnostics is not None:
+                try:
+                    self.workflow_process_diagnostics.workflow_finished(
+                        self.get_runtime_snapshot()
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "Workflow process diagnostics finalization failed"
+                    )
 
     def _move_to_next_step(self):
         self.current_step_index += 1
@@ -362,7 +385,14 @@ class WorkflowRunner:
                 expected_target_session=self._expected_target_session,
                 input_safety_gate=self.input_safety_gate,
                 on_input_blocked=lambda reason, token=generation: self._on_input_blocked(reason, token),
+                workflow_process_diagnostics=self.workflow_process_diagnostics,
             )
+            if self.workflow_process_diagnostics is not None:
+                self.workflow_process_diagnostics.stage(
+                    "TRIGGER_RUNNER_CREATED",
+                    step_id=self.current_step.get("id"),
+                    trigger_runner_generation=generation,
+                )
             self._active_trigger_runner.start()
             self.state = WorkflowState.WAIT_TRIGGER
             self.logger.info("Workflow step active: %s", self.current_step.get("id"))

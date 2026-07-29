@@ -70,6 +70,14 @@ class ScreenBotApp:
         self.window_tracker.attach_target_session(self.target_session)
         self.input_safety_gate = ForegroundInputSafetyGate(self.target_session, self.window_tracker, self.logger)
         self.ocr_process_diagnostics = None
+        self.workflow_process_diagnostics = None
+        if os.environ.get("SCREENBOT_WORKFLOW_PROCESS_DIAGNOSTIC") == "1":
+            from app.workflow_process_diagnostics import WorkflowProcessDiagnostics
+
+            self.workflow_process_diagnostics = WorkflowProcessDiagnostics(
+                self.root_path,
+                self.logger,
+            )
         if os.environ.get("SCREENBOT_OCR_PROCESS_DIAGNOSTIC") == "1":
             from app.ocr_process_diagnostics import OcrProcessDiagnostics
 
@@ -84,13 +92,20 @@ class ScreenBotApp:
             lang=self.settings.get("ocr_lang", "eng+chi_tra"),
         )
         self.text_detector.ocr_pipeline.set_process_diagnostics(
-            self.ocr_process_diagnostics
+            self.workflow_process_diagnostics or self.ocr_process_diagnostics
         )
         self.trigger_runner = None
         self.player = ScriptPlayer(self.window_tracker, input_safety_gate=self.input_safety_gate)
         self.player.on_error = self._handle_player_error
         self.player.on_finished = self._handle_player_finished
-        self.workflow_runner = WorkflowRunner(self.text_detector, self.script_store, self.player, logger=self.logger, input_safety_gate=self.input_safety_gate)
+        self.workflow_runner = WorkflowRunner(
+            self.text_detector,
+            self.script_store,
+            self.player,
+            logger=self.logger,
+            input_safety_gate=self.input_safety_gate,
+            workflow_process_diagnostics=self.workflow_process_diagnostics,
+        )
         self.workflow_diagnostics = WorkflowDiagnostics(self.root_path, self.logger)
         self.start_handoff = StartHandoffService(timeout_seconds=15.0)
         self.workflow_data = None
@@ -437,6 +452,9 @@ class ScreenBotApp:
 
         self.set_state(AppState.IDLE)
         self.start_handoff_timer.start()
+        diagnostics = getattr(self, "workflow_process_diagnostics", None)
+        if diagnostics is not None and diagnostics.active:
+            diagnostics.bind_request(request.request_id)
         self._record_start_handoff_event("START_REQUEST_CREATED", result.snapshot, request=request)
         self._record_start_handoff_event("START_REQUEST_ARMED", result.snapshot, request=request)
         self._refresh_handoff_presentation()
@@ -960,6 +978,8 @@ class ScreenBotApp:
             self.overlay_diagnostics.close()
         if self.ocr_process_diagnostics is not None:
             self.ocr_process_diagnostics.close()
+        if self.workflow_process_diagnostics is not None:
+            self.workflow_process_diagnostics.close()
         self.app.quit()
 
     def configure_text_trigger(self, trigger_data):
@@ -1042,6 +1062,13 @@ class ScreenBotApp:
             target=self.window_tracker.target,
             capture_backend=(self.text_detector.get_capture_runtime_diagnostics() or {}).get("selected_backend"),
         )
+        diagnostics = getattr(self, "workflow_process_diagnostics", None)
+        if diagnostics is not None and diagnostics.active:
+            diagnostics.bind_run(self.workflow_diagnostics.current_run_id)
+            diagnostics.stage(
+                "WORKFLOW_RUNNER_START_REQUESTED",
+                workflow_name=self.workflow_data.get("name"),
+            )
         self.workflow_runner.start()
         # The runner snapshot becomes authoritative as soon as its worker
         # advances.  STARTING remains only as the short hand-off state.
@@ -1100,8 +1127,21 @@ class ScreenBotApp:
             if not filename:
                 self._show_message("請選擇 Workflow", "請先從下拉選單選擇 Workflow。")
                 return
+            diagnostics = getattr(self, "workflow_process_diagnostics", None)
+            if diagnostics is not None and diagnostics.enabled:
+                diagnostics.begin_trace(
+                    workflow_identifier=filename,
+                    target_snapshot=self.target_session.get_snapshot(),
+                    compact_hwnd=int(self.widget.winId()),
+                    quarantine_callback=self._on_workflow_diagnostic_quarantine,
+                )
+                diagnostics.stage("START_BUTTON_CLICKED")
             workflow = self.workflow_store.load_workflow(filename)
+            if diagnostics is not None and diagnostics.active:
+                diagnostics.stage("WORKFLOW_LOADED")
             resolved_workflow = self.workflow_resolver.resolve(workflow)
+            if diagnostics is not None and diagnostics.active:
+                diagnostics.stage("WORKFLOW_RESOLVED")
             self._arm_start_request(
                 StartRequestKind.WORKFLOW,
                 copy.deepcopy(resolved_workflow),
@@ -1115,6 +1155,30 @@ class ScreenBotApp:
             self.widget.set_workflow_running(False)
             self._update_workflow_runtime_ui()
             self._show_message("Workflow 載入失敗", str(exc))
+            diagnostics = getattr(self, "workflow_process_diagnostics", None)
+            if diagnostics is not None and diagnostics.active:
+                diagnostics.stage(
+                    "WORKFLOW_START_FAILED",
+                    exception_type=type(exc).__name__,
+                    error=str(exc),
+                )
+                diagnostics.end_trace("workflow_start_failed")
+
+    def _on_workflow_diagnostic_quarantine(self, reason, details):
+        """Fail closed from a diagnostic worker without touching Qt."""
+        diagnostics = getattr(self, "workflow_process_diagnostics", None)
+        if diagnostics is not None and diagnostics.active:
+            diagnostics.stage(
+                "WORKFLOW_STOP_REQUESTED",
+                source="diagnostic_input_quarantine",
+                quarantine_reason=reason,
+            )
+        accepted = self.workflow_runner.request_immediate_stop(
+            "diagnostic_input_quarantine",
+            details,
+        )
+        if not accepted and not self.workflow_runner.is_active():
+            diagnostics.end_trace("quarantine_before_runner_start")
 
     def _stop_workflow_from_ui(self):
         try:
@@ -1537,6 +1601,9 @@ class ScreenBotApp:
         else:
             self.logger.info("%s %s", event, data)
         self._record_overlay_diagnostic(event, **data)
+        diagnostics = getattr(self, "workflow_process_diagnostics", None)
+        if diagnostics is not None and diagnostics.active:
+            diagnostics.stage(event, **data)
 
     def _refresh_handoff_presentation(self):
         handoff_service = getattr(self, "start_handoff", None)
