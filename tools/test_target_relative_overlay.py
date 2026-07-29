@@ -47,6 +47,16 @@ class FakeSignal:
             callback(*args)
 
 
+class FakeCoordinatorDiagnostics:
+    enabled = True
+
+    def __init__(self):
+        self.events = []
+
+    def observe_coordinator_event(self, event, **data):
+        self.events.append((event, data))
+
+
 class FakeTimer:
     def __init__(self, single_shot):
         self.single_shot = single_shot
@@ -79,8 +89,9 @@ class FakeTimer:
 
 
 class FakeWidget:
-    def __init__(self, hwnd=OVERLAY):
+    def __init__(self, hwnd=OVERLAY, diagnostics=None):
         self.hwnd = hwnd
+        self._overlay_diagnostics = diagnostics
         self.compact_hwnd_changed = FakeSignal()
         self.compact_geometry_changed = FakeSignal()
         self.compact_visibility_intent_changed = FakeSignal()
@@ -264,10 +275,10 @@ def make_snapshot(
 
 
 class CoordinatorHarness:
-    def __init__(self, snapshot=None):
+    def __init__(self, snapshot=None, diagnostics=None):
         self.snapshot = snapshot or make_snapshot()
         self.target_session = FakeTargetSession(self.snapshot)
-        self.widget = FakeWidget()
+        self.widget = FakeWidget(diagnostics=diagnostics)
         self.adapter = FakeWin32Adapter()
         self.timers = []
 
@@ -321,6 +332,20 @@ class TargetRelativeOverlayTests(unittest.TestCase):
         )
         self.assertTrue(
             all(call["flags"] & SWP_NOACTIVATE for call in harness.adapter.calls)
+        )
+
+    def test_enabled_lifecycle_diagnostics_do_not_interrupt_reconcile(self):
+        diagnostics = FakeCoordinatorDiagnostics()
+        harness = CoordinatorHarness(diagnostics=diagnostics)
+        harness.start_and_reconcile()
+
+        events = [event for event, _data in diagnostics.events]
+        self.assertIn("COORDINATOR_BIND", events)
+        self.assertIn("COORDINATOR_VISIBILITY_DECISION", events)
+        self.assertFalse(harness.widget.suppression[-1])
+        self.assertEqual(
+            harness.adapter.order.index(OVERLAY) + 1,
+            harness.adapter.order.index(TARGET),
         )
 
     def test_target_at_top_of_normal_band_uses_hwnd_top_not_target(self):

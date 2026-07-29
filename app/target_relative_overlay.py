@@ -341,6 +341,7 @@ class TargetRelativeOverlayCoordinator(QObject):
         if not self._snapshot_is_attached(snapshot):
             self.detach(hide=True)
             return
+        old_binding = self._binding
         binding = (
             str(snapshot.session_id),
             int(snapshot.generation),
@@ -356,9 +357,30 @@ class TargetRelativeOverlayCoordinator(QObject):
             self._native_hidden = not self.adapter.is_visible(snapshot.root_hwnd)
             self._effective_visible = None
             self._offset = self._capture_offset(snapshot)
+        self._observe_lifecycle_event(
+            "COORDINATOR_BIND",
+            reason="target_snapshot",
+            old_session_id=old_binding[0] if old_binding else None,
+            old_generation=old_binding[1] if old_binding else None,
+            old_target_root=old_binding[2] if old_binding else 0,
+            new_session_id=binding[0],
+            new_generation=binding[1],
+            new_target_root=binding[2],
+            replacing=replacing,
+        )
         self.request_reconcile(snapshot.generation, reason="target_bind")
 
     def detach(self, hide=True):
+        old_binding = self._binding
+        self._observe_lifecycle_event(
+            "COORDINATOR_DETACH",
+            reason="detach",
+            target_hwnd=old_binding[2] if old_binding else 0,
+            old_session_id=old_binding[0] if old_binding else None,
+            old_generation=old_binding[1] if old_binding else None,
+            old_target_root=old_binding[2] if old_binding else 0,
+            hide_requested=bool(hide),
+        )
         if hide:
             self._set_effective_visible(False)
         self._binding = None
@@ -386,7 +408,14 @@ class TargetRelativeOverlayCoordinator(QObject):
                 self._offset = new_offset
 
     def on_visibility_intent(self, visible):
+        previous = self._ui_wants_visible
         self._ui_wants_visible = bool(visible)
+        self._observe_lifecycle_event(
+            "COORDINATOR_VISIBILITY_INTENT",
+            reason="widget_signal",
+            old_user_wants_visible=previous,
+            new_user_wants_visible=self._ui_wants_visible,
+        )
         if not self._ui_wants_visible:
             self._set_effective_visible(False)
         if self._snapshot is not None:
@@ -395,6 +424,30 @@ class TargetRelativeOverlayCoordinator(QObject):
             )
 
     def _on_target_event(self, event, snapshot, _payload):
+        incoming = (
+            (
+                str(snapshot.session_id),
+                int(snapshot.generation),
+                int(snapshot.root_hwnd),
+            )
+            if snapshot is not None
+            else None
+        )
+        self._observe_lifecycle_event(
+            "COORDINATOR_TARGET_EVENT",
+            reason=str(event),
+            target_hwnd=incoming[2] if incoming else 0,
+            event_name=str(event),
+            incoming_session_id=incoming[0] if incoming else None,
+            incoming_generation=incoming[1] if incoming else None,
+            incoming_target_root=incoming[2] if incoming else 0,
+            current_session_id=self._binding[0] if self._binding else None,
+            current_generation=self._binding[1] if self._binding else None,
+            current_target_root=self._binding[2] if self._binding else 0,
+            incoming_is_current=bool(
+                snapshot is not None and self._is_current_binding(snapshot)
+            ),
+        )
         if event in {"TARGET_SESSION_CLEARED", "TARGET_DISCONNECTED"}:
             if snapshot is None or self._is_current_binding(snapshot):
                 self.detach(hide=True)
@@ -429,6 +482,19 @@ class TargetRelativeOverlayCoordinator(QObject):
         target_hwnd = self._binding[2]
         event_root = self.adapter.root_hwnd(hwnd) if hwnd else 0
         targets_current_root = event_root == target_hwnd
+        self._observe_lifecycle_event(
+            "COORDINATOR_WIN_EVENT_DECISION",
+            reason=f"winevent:{event:#x}",
+            target_hwnd=target_hwnd,
+            source_hwnd=hwnd,
+            normalized_root_hwnd=event_root,
+            event_id=event,
+            current_generation=self._binding[1],
+            current_target_root=target_hwnd,
+            targets_current_root=targets_current_root,
+            native_minimized=self._native_minimized,
+            native_hidden=self._native_hidden,
+        )
         if event == EVENT_OBJECT_DESTROY and targets_current_root:
             self.detach(hide=True)
             return
@@ -471,6 +537,13 @@ class TargetRelativeOverlayCoordinator(QObject):
         if self._closed or self._binding is None:
             return
         if generation is not None and int(generation) != self._binding[1]:
+            self._observe_lifecycle_event(
+                "COORDINATOR_RECONCILE_SKIPPED",
+                reason=str(reason),
+                requested_generation=int(generation),
+                current_generation=self._binding[1],
+                skip_reason="stale_generation",
+            )
             return
         self._pending_generation = self._binding[1]
         self._pending_reconcile_reason = str(reason)
@@ -753,8 +826,26 @@ class TargetRelativeOverlayCoordinator(QObject):
 
     def _set_effective_visible(self, visible):
         visible = bool(visible)
+        previous = self._effective_visible
         if self._effective_visible is visible:
+            self._observe_lifecycle_event(
+                "COORDINATOR_VISIBILITY_DECISION",
+                reason=self._active_reconcile_reason,
+                requested_visible=visible,
+                previous_effective_visible=previous,
+                effective_visible=self._effective_visible,
+                decision="no-op",
+            )
             return
+        self._observe_lifecycle_event(
+            "COORDINATOR_VISIBILITY_DECISION",
+            reason=self._active_reconcile_reason,
+            requested_visible=visible,
+            previous_effective_visible=previous,
+            effective_visible=visible,
+            decision="show" if visible else "hide",
+            phase="before",
+        )
         self._effective_visible = visible
         setter = getattr(self.widget, "set_target_visibility_suppressed", None)
         if callable(setter):
@@ -763,6 +854,41 @@ class TargetRelativeOverlayCoordinator(QObject):
             self.adapter.show_no_activate(self._overlay_hwnd)
         else:
             self.adapter.hide(self._overlay_hwnd)
+        self._observe_lifecycle_event(
+            "COORDINATOR_VISIBILITY_DECISION",
+            reason=self._active_reconcile_reason,
+            requested_visible=visible,
+            previous_effective_visible=previous,
+            effective_visible=self._effective_visible,
+            decision="show" if visible else "hide",
+            phase="after",
+        )
+
+    def _observe_lifecycle_event(self, event, **data):
+        diagnostics = self._diagnostics
+        observer = getattr(diagnostics, "observe_coordinator_event", None)
+        if not (
+            callable(observer)
+            and getattr(diagnostics, "enabled", False)
+        ):
+            return
+        target_hwnd = data.pop(
+            "target_hwnd",
+            self._binding[2] if self._binding else 0,
+        )
+        payload = dict(data)
+        payload.setdefault("binding", self._binding)
+        payload.setdefault("user_wants_visible", self._ui_wants_visible)
+        payload.setdefault("effective_visible", self._effective_visible)
+        payload.setdefault("native_minimized", self._native_minimized)
+        payload.setdefault("native_hidden", self._native_hidden)
+        observer(
+            event,
+            overlay_hwnd=self._overlay_hwnd,
+            target_hwnd=target_hwnd,
+            widget=self.widget,
+            **payload,
+        )
 
     def _is_current_binding(self, snapshot):
         return bool(

@@ -124,6 +124,51 @@ class OverlayDiagnosticsTests(unittest.TestCase):
             self.assertTrue(any(record["event"] == "WINEVENT_HOOK_STARTED" for record in records))
             self.assertTrue(any(record["event"] == "WINEVENT_HOOK_STOPPED" for record in records))
 
+    def test_coordinator_lifecycle_event_records_visibility_handoff(self):
+        adapter = _FakeAdapter()
+
+        class _Widget:
+            _target_visibility_suppressed = True
+
+            @staticmethod
+            def isVisible():
+                return False
+
+            @staticmethod
+            def is_compact_visibility_intended():
+                return True
+
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics = OverlayDiagnostics(
+                directory, adapter=adapter, enabled=True
+            )
+            diagnostics.observe_coordinator_event(
+                "COORDINATOR_BIND",
+                overlay_hwnd=10,
+                target_hwnd=20,
+                widget=_Widget(),
+                old_generation=21,
+                new_generation=22,
+                old_target_root=40,
+                new_target_root=20,
+                user_wants_visible=True,
+                effective_visible=False,
+            )
+            records = self._read_records(diagnostics)
+
+        event = next(
+            record
+            for record in records
+            if record["event"] == "COORDINATOR_BIND"
+        )
+        self.assertEqual(21, event["old_generation"])
+        self.assertEqual(22, event["new_generation"])
+        self.assertTrue(event["qt_visibility_intent"])
+        self.assertTrue(event["qt_target_suppressed"])
+        self.assertFalse(event["qt_visible"])
+        self.assertTrue(event["overlay_valid"])
+        self.assertTrue(event["target_valid"])
+
     def test_style_parser_and_z_order_capture_preserve_observed_order(self):
         flags = parse_window_styles(
             WS_CHILD | WS_VISIBLE,

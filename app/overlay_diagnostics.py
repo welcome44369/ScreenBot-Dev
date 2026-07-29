@@ -896,6 +896,49 @@ class OverlayDiagnostics(QObject):
         )
         self.capture_z_order_snapshot(f"COORDINATOR_{phase}_{reason}")
 
+    def observe_coordinator_event(
+        self,
+        event,
+        *,
+        overlay_hwnd=0,
+        target_hwnd=0,
+        widget=None,
+        **data,
+    ):
+        """Record coordinator lifecycle state without changing its decisions."""
+        if not self.enabled:
+            return
+        overlay = self.capture_window(overlay_hwnd)
+        target = self.capture_window(target_hwnd)
+        qt_data = {}
+        if widget is not None:
+            try:
+                qt_data = {
+                    "qt_visible": bool(widget.isVisible()),
+                    "qt_visibility_intent": bool(
+                        widget.is_compact_visibility_intended()
+                    ),
+                    "qt_target_suppressed": bool(
+                        getattr(widget, "_target_visibility_suppressed", False)
+                    ),
+                }
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                qt_data = {"qt_snapshot_error": True}
+        self.record_event(
+            str(event),
+            thread_id=int(__import__("threading").get_ident()),
+            overlay_hwnd=int(overlay_hwnd or 0),
+            overlay_valid=bool(overlay.get("is_window")),
+            overlay_native_visible=overlay.get("is_visible"),
+            target_hwnd=int(target_hwnd or 0),
+            target_root_hwnd=target.get("root_hwnd"),
+            target_valid=bool(target.get("is_window")),
+            target_native_visible=target.get("is_visible"),
+            target_iconic=target.get("is_iconic"),
+            **qt_data,
+            **data,
+        )
+
     def observe_set_window_pos(
         self,
         phase,
