@@ -149,6 +149,9 @@ class FakeWin32Adapter:
         self.hidden = set()
         self.order = [TOPMOST_OTHER, OTHER, OVERLAY, TARGET]
         self.calls = []
+        self.pair_calls = []
+        self.pair_reorder_succeeds = True
+        self.foreground = OTHER
         self.hook_callback = None
         self.unhooked = None
 
@@ -209,6 +212,34 @@ class FakeWin32Adapter:
                 int(y + height),
             )
         return True
+
+    def reorder_target_pair(self, overlay_hwnd, target_hwnd, flags):
+        overlay_hwnd = int(overlay_hwnd)
+        target_hwnd = int(target_hwnd)
+        self.pair_calls.append(
+            {
+                "overlay_hwnd": overlay_hwnd,
+                "target_hwnd": target_hwnd,
+                "flags": int(flags),
+            }
+        )
+        if (
+            not self.pair_reorder_succeeds
+            or not flags & SWP_NOACTIVATE
+            or self.is_topmost(overlay_hwnd)
+            or self.is_topmost(target_hwnd)
+        ):
+            return False
+        if not self.set_window_pos(
+            overlay_hwnd, target_hwnd, 0, 0, 0, 0, flags
+        ):
+            return False
+        return self.set_window_pos(
+            target_hwnd, overlay_hwnd, 0, 0, 0, 0, flags
+        )
+
+    def foreground_hwnd(self):
+        return self.foreground
 
     def _place_at_top_of_band(self, hwnd, topmost):
         if hwnd in self.order:
@@ -348,15 +379,70 @@ class TargetRelativeOverlayTests(unittest.TestCase):
             harness.adapter.order.index(TARGET),
         )
 
-    def test_target_at_top_of_normal_band_uses_hwnd_top_not_target(self):
+    def test_target_at_top_of_normal_band_uses_atomic_pair_reorder(self):
         harness = CoordinatorHarness()
         harness.adapter.order = [TOPMOST_OTHER, TARGET, OVERLAY, OTHER]
+        harness.adapter.foreground = TARGET
         harness.start_and_reconcile()
         z_calls = [
             call for call in harness.adapter.calls if not call["flags"] & SWP_NOZORDER
         ]
-        self.assertEqual(HWND_TOP, z_calls[-1]["insert_after"])
+        self.assertFalse(
+            any(
+                call["hwnd"] == OVERLAY and call["insert_after"] == HWND_TOP
+                for call in z_calls
+            )
+        )
+        self.assertEqual(1, len(harness.adapter.pair_calls))
+        self.assertTrue(
+            harness.adapter.pair_calls[0]["flags"] & SWP_NOACTIVATE
+        )
+        pair_native_calls = [
+            call
+            for call in z_calls
+            if call["hwnd"] in {OVERLAY, TARGET}
+        ]
+        self.assertEqual(
+            [(OVERLAY, TARGET), (TARGET, OVERLAY)],
+            [
+                (call["hwnd"], call["insert_after"])
+                for call in pair_native_calls
+            ],
+        )
         self.assertEqual([TOPMOST_OTHER, OVERLAY, TARGET], harness.adapter.order[:3])
+        self.assertEqual(TARGET, harness.adapter.foreground)
+
+    def test_real_predecessor_path_does_not_use_pair_reorder(self):
+        harness = CoordinatorHarness()
+        harness.adapter.order = [TOPMOST_OTHER, OTHER, TARGET, OVERLAY]
+        harness.start_and_reconcile()
+        self.assertEqual([], harness.adapter.pair_calls)
+        z_calls = [
+            call for call in harness.adapter.calls if not call["flags"] & SWP_NOZORDER
+        ]
+        self.assertEqual(OTHER, z_calls[-1]["insert_after"])
+
+    def test_pair_reorder_failure_preserves_binding_and_visibility(self):
+        harness = CoordinatorHarness()
+        harness.adapter.order = [TOPMOST_OTHER, TARGET, OVERLAY, OTHER]
+        harness.adapter.foreground = TARGET
+        harness.adapter.pair_reorder_succeeds = False
+        harness.start_and_reconcile()
+        self.assertEqual(("session-a", 1, TARGET), harness.coordinator._binding)
+        self.assertTrue(harness.coordinator._effective_visible)
+        self.assertEqual([TOPMOST_OTHER, TARGET, OVERLAY, OTHER], harness.adapter.order)
+
+    def test_settled_top_pair_does_not_repeat_native_mutation(self):
+        harness = CoordinatorHarness()
+        harness.adapter.order = [TOPMOST_OTHER, TARGET, OVERLAY, OTHER]
+        harness.adapter.foreground = TARGET
+        harness.start_and_reconcile()
+        self.assertEqual(1, len(harness.adapter.pair_calls))
+        harness.adapter.calls.clear()
+        harness.adapter.pair_calls.clear()
+        harness.healing.fire()
+        self.assertEqual([], harness.adapter.calls)
+        self.assertEqual([], harness.adapter.pair_calls)
 
     def test_topmost_target_never_promotes_overlay(self):
         harness = CoordinatorHarness()

@@ -92,6 +92,8 @@ class TargetRelativeOverlayWin32Adapter:
             wintypes.UINT,
         )
         self.user32.SetWindowPos.restype = wintypes.BOOL
+        self.user32.GetForegroundWindow.argtypes = ()
+        self.user32.GetForegroundWindow.restype = wintypes.HWND
         self.user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
         self.user32.ShowWindow.restype = wintypes.BOOL
 
@@ -164,6 +166,32 @@ class TargetRelativeOverlayWin32Adapter:
                 int(flags),
             )
         )
+
+    def reorder_target_pair(self, overlay_hwnd, target_hwnd, flags):
+        """Swap one real-HWND pair without using HWND_TOP or activation."""
+        if (
+            not self.is_window(overlay_hwnd)
+            or not self.is_window(target_hwnd)
+            or not (flags & SWP_NOACTIVATE)
+            or self.is_topmost(overlay_hwnd)
+            or self.is_topmost(target_hwnd)
+        ):
+            return False
+        # First make the two windows adjacent at the target's current band
+        # position.  Then reverse only that adjacent pair.  If the second call
+        # fails, the active target remains above the overlay (the safe state).
+        if not self.set_window_pos(
+            overlay_hwnd, target_hwnd, 0, 0, 0, 0, flags
+        ):
+            return False
+        return self.set_window_pos(
+            target_hwnd, overlay_hwnd, 0, 0, 0, 0, flags
+        )
+
+    def foreground_hwnd(self):
+        if not self.user32:
+            return 0
+        return int(self.user32.GetForegroundWindow() or 0)
 
     def show_no_activate(self, hwnd):
         return bool(
@@ -665,7 +693,8 @@ class TargetRelativeOverlayCoordinator(QObject):
             | SWP_NOOWNERZORDER
             | SWP_NOSENDCHANGING
         )
-        self._ensure_overlay_non_topmost()
+        if not self._ensure_overlay_non_topmost():
+            return False
         order = self.adapter.z_order_top_to_bottom()
         if self.adapter.is_topmost(snapshot.root_hwnd):
             # A topmost target cannot have a non-topmost overlay directly
@@ -675,7 +704,7 @@ class TargetRelativeOverlayCoordinator(QObject):
         try:
             target_index = order.index(int(snapshot.root_hwnd))
         except ValueError:
-            target_index = -1
+            return False
         if target_index > 0 and order[target_index - 1] == self._overlay_hwnd:
             self._observe_reconcile(
                 "decision",
@@ -691,6 +720,16 @@ class TargetRelativeOverlayCoordinator(QObject):
             )
             return True
         insert_after = self._z_insert_after(snapshot)
+        if insert_after is None:
+            self._observe_reconcile(
+                "decision",
+                snapshot,
+                suppressed=False,
+                computed_predecessor=None,
+                already_settled=False,
+                set_window_pos_action="pair_reorder",
+            )
+            return self._reorder_foreground_pair(snapshot, base_flags)
         self._observe_reconcile(
             "decision",
             snapshot,
@@ -716,13 +755,49 @@ class TargetRelativeOverlayCoordinator(QObject):
         try:
             target_index = order.index(target)
         except ValueError:
-            return HWND_TOP
+            return None
         for hwnd in reversed(order[:target_index]):
             if hwnd == self._overlay_hwnd or not self.adapter.is_window(hwnd):
                 continue
             if not self.adapter.is_topmost(hwnd):
                 return int(hwnd)
-        return HWND_TOP
+        return None
+
+    def _reorder_foreground_pair(self, snapshot, flags):
+        foreground_before = self.adapter.foreground_hwnd()
+        result = self.adapter.reorder_target_pair(
+            self._overlay_hwnd,
+            int(snapshot.root_hwnd),
+            flags,
+        )
+        foreground_after = self.adapter.foreground_hwnd()
+        order = self.adapter.z_order_top_to_bottom()
+        try:
+            overlay_index = order.index(self._overlay_hwnd)
+            target_index = order.index(int(snapshot.root_hwnd))
+        except ValueError:
+            overlay_index = -1
+            target_index = -1
+        settled = (
+            overlay_index >= 0
+            and target_index == overlay_index + 1
+            and foreground_before == foreground_after
+        )
+        self._observe_lifecycle_event(
+            "COORDINATOR_PAIR_REORDER",
+            reason=self._active_reconcile_reason,
+            target_hwnd=int(snapshot.root_hwnd),
+            flags=int(flags),
+            result=bool(result),
+            foreground_before=foreground_before,
+            foreground_after=foreground_after,
+            overlay_index=overlay_index,
+            target_index=target_index,
+            pair_settled=settled,
+            overlay_topmost=self.adapter.is_topmost(self._overlay_hwnd),
+            target_topmost=self.adapter.is_topmost(snapshot.root_hwnd),
+        )
+        return bool(result and settled)
 
     def _ensure_overlay_non_topmost(self):
         if not self.adapter.is_window(self._overlay_hwnd):
