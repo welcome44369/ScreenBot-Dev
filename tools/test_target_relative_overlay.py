@@ -3,11 +3,18 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+import logging
+from types import SimpleNamespace
 import unittest
 
+from app.application import ScreenBotApp
 from app.target_relative_overlay import (
     EVENT_OBJECT_DESTROY,
     EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_REORDER,
+    EVENT_SYSTEM_FOREGROUND,
+    EVENT_SYSTEM_MINIMIZEEND,
+    EVENT_SYSTEM_MINIMIZESTART,
     HWND_NOTOPMOST,
     HWND_TOP,
     HWND_TOPMOST,
@@ -127,6 +134,8 @@ class FakeWin32Adapter:
             TOPMOST_OTHER: (0, 0, 500, 500),
         }
         self.topmost = {TOPMOST_OTHER}
+        self.iconic = set()
+        self.hidden = set()
         self.order = [TOPMOST_OTHER, OTHER, OVERLAY, TARGET]
         self.calls = []
         self.hook_callback = None
@@ -137,6 +146,15 @@ class FakeWin32Adapter:
 
     def window_rect(self, hwnd):
         return self.rects.get(int(hwnd or 0))
+
+    def root_hwnd(self, hwnd):
+        return int(hwnd or 0) if self.is_window(hwnd) else 0
+
+    def is_iconic(self, hwnd):
+        return int(hwnd or 0) in self.iconic
+
+    def is_visible(self, hwnd):
+        return self.is_window(hwnd) and int(hwnd or 0) not in self.hidden
 
     def is_topmost(self, hwnd):
         return int(hwnd or 0) in self.topmost
@@ -315,23 +333,14 @@ class TargetRelativeOverlayTests(unittest.TestCase):
         self.assertEqual(HWND_TOP, z_calls[-1]["insert_after"])
         self.assertEqual([TOPMOST_OTHER, OVERLAY, TARGET], harness.adapter.order[:3])
 
-    def test_topmost_band_is_followed_and_later_removed(self):
+    def test_topmost_target_never_promotes_overlay(self):
         harness = CoordinatorHarness()
         harness.adapter.topmost.add(TARGET)
         harness.adapter.order = [TOPMOST_OTHER, OTHER, OVERLAY, TARGET]
         harness.start_and_reconcile()
-        self.assertIn(OVERLAY, harness.adapter.topmost)
-        self.assertIn(
-            HWND_TOPMOST,
-            [call["insert_after"] for call in harness.adapter.calls],
-        )
-
-        harness.adapter.topmost.discard(TARGET)
-        harness.adapter.calls.clear()
-        harness.coordinator.reconcile(1)
         self.assertNotIn(OVERLAY, harness.adapter.topmost)
-        self.assertIn(
-            HWND_NOTOPMOST,
+        self.assertNotIn(
+            HWND_TOPMOST,
             [call["insert_after"] for call in harness.adapter.calls],
         )
 
@@ -373,8 +382,43 @@ class TargetRelativeOverlayTests(unittest.TestCase):
         harness.coordinator.reconcile(1)
         harness.target_session.snapshot = harness.snapshot
         harness.coordinator.reconcile(1)
-        self.assertFalse(harness.widget.suppression[-1])
+        self.assertTrue(harness.widget.suppression[-1])
         self.assertFalse(harness.coordinator._ui_wants_visible)
+
+    def test_native_minimize_latch_hides_until_minimize_end(self):
+        harness = CoordinatorHarness()
+        harness.start_and_reconcile()
+        harness.adapter.iconic.add(TARGET)
+        harness.coordinator._on_win_event(
+            {
+                "event": EVENT_SYSTEM_MINIMIZESTART,
+                "hwnd": TARGET,
+                "object_id": 0,
+            }
+        )
+        self.assertTrue(harness.widget.suppression[-1])
+        for event in (
+            EVENT_OBJECT_REORDER,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            EVENT_SYSTEM_FOREGROUND,
+        ):
+            harness.coordinator._on_win_event(
+                {"event": event, "hwnd": TARGET, "object_id": 0}
+            )
+        harness.debounce.fire()
+        harness.healing.fire()
+        self.assertTrue(harness.widget.suppression[-1])
+
+        harness.adapter.iconic.remove(TARGET)
+        harness.coordinator._on_win_event(
+            {
+                "event": EVENT_SYSTEM_MINIMIZEEND,
+                "hwnd": TARGET,
+                "object_id": 0,
+            }
+        )
+        harness.debounce.fire()
+        self.assertFalse(harness.widget.suppression[-1])
 
     def test_destroy_detaches_and_stops_healing(self):
         harness = CoordinatorHarness()
@@ -430,6 +474,26 @@ class TargetRelativeOverlayTests(unittest.TestCase):
             any(call["hwnd"] == new_overlay for call in harness.adapter.calls)
         )
 
+    def test_compact_hwnd_recreation_explicitly_clears_topmost(self):
+        harness = CoordinatorHarness()
+        harness.start_and_reconcile()
+        new_overlay = 102
+        harness.adapter.valid.add(new_overlay)
+        harness.adapter.rects[new_overlay] = (150, 170, 570, 260)
+        harness.adapter.topmost.add(new_overlay)
+        harness.adapter.order.insert(0, new_overlay)
+        harness.widget.hwnd = new_overlay
+        harness.widget.compact_hwnd_changed.emit(OVERLAY, new_overlay)
+        self.assertNotIn(new_overlay, harness.adapter.topmost)
+        self.assertTrue(
+            any(
+                call["hwnd"] == new_overlay
+                and call["insert_after"] == HWND_NOTOPMOST
+                and call["flags"] & SWP_NOACTIVATE
+                for call in harness.adapter.calls
+            )
+        )
+
     def test_event_burst_is_coalesced_and_healing_requires_binding(self):
         harness = CoordinatorHarness()
         harness.coordinator.start()
@@ -481,6 +545,25 @@ class TargetRelativeOverlayTests(unittest.TestCase):
         )
         for fragment in forbidden_fragments:
             self.assertNotIn(fragment, source)
+
+    def test_f8_handler_is_lock_only_with_no_deferred_start(self):
+        app = ScreenBotApp.__new__(ScreenBotApp)
+        app.logger = logging.getLogger("test.overlay.f8")
+        calls = []
+        app.workflow_runner = SimpleNamespace(
+            is_active=lambda: False,
+            start=lambda: self.fail("F8 must not start Workflow"),
+        )
+        app.player = SimpleNamespace(
+            start=lambda *_args, **_kwargs: self.fail("F8 must not start Player")
+        )
+        app.lock_or_refresh_target_only = lambda: calls.append("bind")
+
+        app._handle_f8()
+        for _fake_tick in range(50):
+            pass
+
+        self.assertEqual(["bind"], calls)
 
 
 if __name__ == "__main__":

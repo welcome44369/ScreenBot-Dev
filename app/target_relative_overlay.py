@@ -12,6 +12,7 @@ from app.target_session import TargetConnectionState, TargetVisibilityState
 
 
 GWL_EXSTYLE = -20
+GA_ROOT = 2
 WS_EX_TOPMOST = 0x00000008
 HWND_TOP = 0
 HWND_TOPMOST = -1
@@ -66,6 +67,12 @@ class TargetRelativeOverlayWin32Adapter:
         pointer = ctypes.c_ssize_t
         self.user32.IsWindow.argtypes = (wintypes.HWND,)
         self.user32.IsWindow.restype = wintypes.BOOL
+        self.user32.IsIconic.argtypes = (wintypes.HWND,)
+        self.user32.IsIconic.restype = wintypes.BOOL
+        self.user32.IsWindowVisible.argtypes = (wintypes.HWND,)
+        self.user32.IsWindowVisible.restype = wintypes.BOOL
+        self.user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+        self.user32.GetAncestor.restype = wintypes.HWND
         self.user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
         self.user32.GetWindowLongPtrW.restype = pointer
         self.user32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
@@ -98,6 +105,24 @@ class TargetRelativeOverlayWin32Adapter:
         if not self.user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
             return None
         return (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom))
+
+    def root_hwnd(self, hwnd):
+        if not self.is_window(hwnd):
+            return 0
+        root = self.user32.GetAncestor(wintypes.HWND(hwnd), GA_ROOT)
+        return int(root or hwnd)
+
+    def is_iconic(self, hwnd):
+        return bool(
+            self.is_window(hwnd)
+            and self.user32.IsIconic(wintypes.HWND(hwnd))
+        )
+
+    def is_visible(self, hwnd):
+        return bool(
+            self.is_window(hwnd)
+            and self.user32.IsWindowVisible(wintypes.HWND(hwnd))
+        )
 
     def is_topmost(self, hwnd):
         if not self.is_window(hwnd):
@@ -235,6 +260,9 @@ class TargetRelativeOverlayCoordinator(QObject):
         self._snapshot = None
         self._overlay_hwnd = 0
         self._offset = None
+        self._native_minimized = False
+        self._native_hidden = False
+        self._effective_visible = None
         visibility_intent = getattr(widget, "is_compact_visibility_intended", None)
         self._ui_wants_visible = (
             bool(visibility_intent()) if callable(visibility_intent) else True
@@ -275,6 +303,7 @@ class TargetRelativeOverlayCoordinator(QObject):
         self.target_session.subscribe(self._receive_target_event)
         self._connect_widget_signals()
         self._overlay_hwnd = int(self.widget.winId() or 0)
+        self._ensure_overlay_non_topmost()
         self._hook_handles = self.adapter.install_win_event_hook(
             self._receive_native_event
         )
@@ -320,21 +349,27 @@ class TargetRelativeOverlayCoordinator(QObject):
         if not self._healing_timer.isActive():
             self._healing_timer.start()
         if replacing:
+            self._native_minimized = self.adapter.is_iconic(snapshot.root_hwnd)
+            self._native_hidden = not self.adapter.is_visible(snapshot.root_hwnd)
+            self._effective_visible = None
             self._offset = self._capture_offset(snapshot)
         self.request_reconcile(snapshot.generation)
 
     def detach(self, hide=True):
         if hide:
-            self._set_suppressed(True)
+            self._set_effective_visible(False)
         self._binding = None
         self._snapshot = None
         self._offset = None
+        self._native_minimized = False
+        self._native_hidden = False
         self._pending_generation = None
         self._debounce_timer.stop()
         self._healing_timer.stop()
 
     def on_compact_hwnd_changed(self, _old_hwnd, new_hwnd):
         self._overlay_hwnd = int(new_hwnd or 0)
+        self._ensure_overlay_non_topmost()
         if self._snapshot is not None:
             self._offset = self._capture_offset(self._snapshot)
             self.request_reconcile(self._snapshot.generation)
@@ -347,6 +382,8 @@ class TargetRelativeOverlayCoordinator(QObject):
 
     def on_visibility_intent(self, visible):
         self._ui_wants_visible = bool(visible)
+        if not self._ui_wants_visible:
+            self._set_effective_visible(False)
         if self._snapshot is not None:
             self.request_reconcile(self._snapshot.generation)
 
@@ -381,14 +418,34 @@ class TargetRelativeOverlayCoordinator(QObject):
         if object_id not in {OBJID_WINDOW, 0}:
             return
         target_hwnd = self._binding[2]
-        if event == EVENT_OBJECT_DESTROY and hwnd == target_hwnd:
+        event_root = self.adapter.root_hwnd(hwnd) if hwnd else 0
+        targets_current_root = event_root == target_hwnd
+        if event == EVENT_OBJECT_DESTROY and targets_current_root:
             self.detach(hide=True)
+            return
+        if event == EVENT_SYSTEM_MINIMIZESTART and targets_current_root:
+            self._native_minimized = True
+            self._set_effective_visible(False)
+            self.request_reconcile(self._binding[1])
+            return
+        if event == EVENT_SYSTEM_MINIMIZEEND and targets_current_root:
+            self._native_minimized = False
+            self.request_reconcile(self._binding[1])
+            return
+        if event == EVENT_OBJECT_HIDE and targets_current_root:
+            self._native_hidden = True
+            self._set_effective_visible(False)
+            self.request_reconcile(self._binding[1])
+            return
+        if event == EVENT_OBJECT_SHOW and targets_current_root:
+            self._native_hidden = False
+            self.request_reconcile(self._binding[1])
             return
         if event == EVENT_SYSTEM_FOREGROUND or hwnd in {
             0,
             target_hwnd,
             self._overlay_hwnd,
-        }:
+        } or targets_current_root:
             self.request_reconcile(self._binding[1])
 
     def request_reconcile(self, generation=None):
@@ -418,15 +475,25 @@ class TargetRelativeOverlayCoordinator(QObject):
         try:
             snapshot = self.target_session.refresh()
         except Exception:
-            self._set_suppressed(True)
+            self._set_effective_visible(False)
             return False
         if not self._is_current_binding(snapshot):
             if snapshot is None or not self._snapshot_is_attached(snapshot):
                 self.detach(hide=True)
             return False
         self._snapshot = snapshot
+        if (
+            not self.adapter.is_iconic(snapshot.root_hwnd)
+            and snapshot.visibility_state != TargetVisibilityState.MINIMIZED
+        ):
+            self._native_minimized = False
+        if (
+            self.adapter.is_visible(snapshot.root_hwnd)
+            and snapshot.visibility_state != TargetVisibilityState.HIDDEN
+        ):
+            self._native_hidden = False
         if self._must_suppress(snapshot):
-            self._set_suppressed(True)
+            self._set_effective_visible(False)
             return False
         if not self.adapter.is_window(self._overlay_hwnd):
             self._overlay_hwnd = int(self.widget.winId() or 0)
@@ -436,7 +503,8 @@ class TargetRelativeOverlayCoordinator(QObject):
             self._offset = self._capture_offset(snapshot)
         if self._offset is None:
             return False
-        self._set_suppressed(False)
+        self._ensure_overlay_non_topmost()
+        self._set_effective_visible(self._ui_wants_visible)
         if not self._ui_wants_visible:
             return True
         self._apply_geometry(snapshot)
@@ -472,8 +540,6 @@ class TargetRelativeOverlayCoordinator(QObject):
         )
 
     def _apply_z_order(self, snapshot):
-        target_topmost = self.adapter.is_topmost(snapshot.root_hwnd)
-        overlay_topmost = self.adapter.is_topmost(self._overlay_hwnd)
         base_flags = (
             SWP_NOMOVE
             | SWP_NOSIZE
@@ -481,12 +547,13 @@ class TargetRelativeOverlayCoordinator(QObject):
             | SWP_NOOWNERZORDER
             | SWP_NOSENDCHANGING
         )
-        if target_topmost != overlay_topmost:
-            band = HWND_TOPMOST if target_topmost else HWND_NOTOPMOST
-            self.adapter.set_window_pos(
-                self._overlay_hwnd, band, 0, 0, 0, 0, base_flags
-            )
+        self._ensure_overlay_non_topmost()
         order = self.adapter.z_order_top_to_bottom()
+        if self.adapter.is_topmost(snapshot.root_hwnd):
+            # A topmost target cannot have a non-topmost overlay directly
+            # above it.  Preserve the safer non-topmost policy and do not
+            # raise the overlay over unrelated foreground windows.
+            return True
         try:
             target_index = order.index(int(snapshot.root_hwnd))
         except ValueError:
@@ -500,27 +567,47 @@ class TargetRelativeOverlayCoordinator(QObject):
 
     def _z_insert_after(self, snapshot):
         target = int(snapshot.root_hwnd)
-        target_topmost = self.adapter.is_topmost(target)
         order = self.adapter.z_order_top_to_bottom()
         try:
             target_index = order.index(target)
         except ValueError:
-            return HWND_TOPMOST if target_topmost else HWND_TOP
+            return HWND_TOP
         for hwnd in reversed(order[:target_index]):
             if hwnd == self._overlay_hwnd or not self.adapter.is_window(hwnd):
                 continue
-            if self.adapter.is_topmost(hwnd) == target_topmost:
+            if not self.adapter.is_topmost(hwnd):
                 return int(hwnd)
-        return HWND_TOPMOST if target_topmost else HWND_TOP
+        return HWND_TOP
 
-    def _set_suppressed(self, suppressed):
+    def _ensure_overlay_non_topmost(self):
+        if not self.adapter.is_window(self._overlay_hwnd):
+            return False
+        if not self.adapter.is_topmost(self._overlay_hwnd):
+            return True
+        flags = (
+            SWP_NOMOVE
+            | SWP_NOSIZE
+            | SWP_NOACTIVATE
+            | SWP_NOOWNERZORDER
+            | SWP_NOSENDCHANGING
+        )
+        self.adapter.set_window_pos(
+            self._overlay_hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags
+        )
+        return not self.adapter.is_topmost(self._overlay_hwnd)
+
+    def _set_effective_visible(self, visible):
+        visible = bool(visible)
+        if self._effective_visible is visible:
+            return
+        self._effective_visible = visible
         setter = getattr(self.widget, "set_target_visibility_suppressed", None)
         if callable(setter):
-            setter(bool(suppressed))
-        elif suppressed:
-            self.adapter.hide(self._overlay_hwnd)
-        else:
+            setter(not visible)
+        elif visible:
             self.adapter.show_no_activate(self._overlay_hwnd)
+        else:
+            self.adapter.hide(self._overlay_hwnd)
 
     def _is_current_binding(self, snapshot):
         return bool(
@@ -539,8 +626,7 @@ class TargetRelativeOverlayCoordinator(QObject):
             and snapshot.identity_valid
         )
 
-    @staticmethod
-    def _must_suppress(snapshot):
+    def _must_suppress(self, snapshot):
         return (
             snapshot.connection_state != TargetConnectionState.ATTACHED
             or not snapshot.identity_valid
@@ -550,4 +636,8 @@ class TargetRelativeOverlayCoordinator(QObject):
                 TargetVisibilityState.HIDDEN,
                 TargetVisibilityState.UNKNOWN,
             }
+            or self._native_minimized
+            or self._native_hidden
+            or self.adapter.is_iconic(snapshot.root_hwnd)
+            or not self.adapter.is_visible(snapshot.root_hwnd)
         )
