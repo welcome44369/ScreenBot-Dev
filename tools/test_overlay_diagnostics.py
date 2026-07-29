@@ -257,6 +257,9 @@ class OverlayDiagnosticsTests(unittest.TestCase):
                 {"event": EVENT_OBJECT_LOCATIONCHANGE, "hwnd": 20}
             )
             diagnostics._record_win_event(
+                {"event": EVENT_OBJECT_LOCATIONCHANGE, "hwnd": 999}
+            )
+            diagnostics._record_win_event(
                 {"event": EVENT_OBJECT_LOCATIONCHANGE, "hwnd": 20}
             )
             diagnostics.observe_compact_lifecycle(

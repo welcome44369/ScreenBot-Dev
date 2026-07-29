@@ -583,8 +583,25 @@ class OverlayDiagnostics(QObject):
     def _record_win_event(self, payload):
         event = int(payload.get("event", 0))
         hwnd = int(payload.get("hwnd", 0))
+        object_id = int(payload.get("object_id", OBJID_WINDOW))
+        if object_id not in {OBJID_WINDOW, 0}:
+            return
+        root = self.adapter.root_hwnd(hwnd)
+        foreground_root = self.adapter.root_hwnd(
+            self.adapter.foreground_hwnd()
+        )
+        relevant_roots = {
+            int(self._compact_hwnd or 0),
+            int(self._locked_target_root or 0),
+            int(foreground_root or 0),
+        }
+        if (
+            event != EVENT_SYSTEM_FOREGROUND
+            and root not in relevant_roots
+        ):
+            return
         if event == EVENT_OBJECT_LOCATIONCHANGE:
-            key = (event, hwnd)
+            key = (event, root)
             now = time.monotonic()
             if now - self._location_samples.get(key, 0.0) < 0.25:
                 return
@@ -764,8 +781,8 @@ class OverlayDiagnostics(QObject):
                 "message_sequence_id": self._message_counter,
                 "message_name": MESSAGE_NAMES[message_id],
                 "message_id": message_id,
-                "receiver_hwnd": int(native_message.hwnd or 0),
-                "top_level_root": self.adapter.root_hwnd(int(native_message.hwnd or 0)),
+                "receiver_hwnd": int(native_message.hWnd or 0),
+                "top_level_root": self.adapter.root_hwnd(int(native_message.hWnd or 0)),
                 "event_type": bytes(event_type).decode(errors="replace"),
                 "wparam": int(native_message.wParam),
                 "lparam": int(native_message.lParam),
