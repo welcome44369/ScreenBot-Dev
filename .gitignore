@@ -13,6 +13,15 @@ dist/
 # Runtime-only/user diagnostic data
 logs/
 ocr-corrections/
+save/
+workflows/
+triggers/
+scripts/
+config/settings.json
+*.log
+*.jsonl
+*.tmp
+*.dmp
 
 # Local editor and operating-system files
 .vscode/
