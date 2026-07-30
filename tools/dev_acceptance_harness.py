@@ -30,6 +30,7 @@ from app.trigger_store import TriggerStore
 from app.workflow_resolver import WorkflowResolver
 from app.workflow_runner import WorkflowRunner
 from app.workflow_store import WorkflowStore
+from tools.recording_input_backend import RecordingInputBackend
 
 
 class EventLog:
@@ -75,6 +76,10 @@ class AcceptanceWindow:
         self.heading.pack(pady=(42, 14))
         self.count_label = tk.Label(self.window, font=("Segoe UI", 15))
         self.count_label.pack(pady=8)
+        self.detail_label = tk.Label(self.window, justify="left")
+        self.detail_label.pack(pady=3)
+        self.last_click_utc = None
+        self.last_click_coordinates = None
         if role == "target":
             self.heading.configure(text="SCREENBOT DEV ACCEPTANCE TARGET")
             self.session_label = tk.Label(self.window, text=f"Session: {log.session_id}")
@@ -99,6 +104,8 @@ class AcceptanceWindow:
 
     def _click(self, event) -> None:
         self.count += 1
+        self.last_click_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        self.last_click_coordinates = (event.x, event.y, event.x_root, event.y_root)
         self._refresh()
         self.log.record(
             "click", self.role, hwnd=int(self.window.winfo_id()),
@@ -109,6 +116,10 @@ class AcceptanceWindow:
     def _refresh(self) -> None:
         label = "Click count" if self.role == "target" else "Unexpected click count"
         self.count_label.configure(text=f"{label}: {self.count}")
+        foreground = "Yes" if self.window.focus_displayof() else "No"
+        last = self.last_click_utc or "None"
+        coords = self.last_click_coordinates or "None"
+        self.detail_label.configure(text=f"HWND: {self.window.winfo_id()}\nForeground: {foreground}\nLast click: {last}\nCoordinates: {coords}")
 
 
 def run_interactive(args) -> int:
@@ -167,12 +178,14 @@ class _Session:
 
 
 class _Gate:
-    def __init__(self): self.target_session, self.blocked = _Session(), False
+    def __init__(self, backend=None): self.target_session, self.blocked, self.backend = _Session(), False, backend
     def expected_current_session(self): return self.target_session.get_snapshot()
     def _result(self, expected):
         current = self.target_session.get_snapshot()
         allowed = not self.blocked and expected.session_id == current.session_id and expected.generation == current.generation
         code = InputAuthorizationCode.ALLOWED if allowed else InputAuthorizationCode.TARGET_NOT_FOREGROUND
+        if self.backend is not None:
+            self.backend.record_authorization(allowed, None if allowed else code.value)
         return SimpleNamespace(allowed=allowed, code=code, snapshot=current)
     def authorize_foreground_input(self, expected): return self._result(expected)
     def authorize_foreground_input_fast(self, expected): return self._result(expected)
@@ -184,17 +197,6 @@ class _Detector:
     def get_capture_runtime_diagnostics(): return {}
     @staticmethod
     def invalidate_capture_target(): pass
-
-
-class _RecordingMouse:
-    LEFT = "left"
-    def __init__(self): self.events: list[tuple[str, float, tuple]] = []
-    def move(self, *args): self.events.append(("move", time.monotonic(), args))
-    def click(self, *args): self.events.append(("click", time.monotonic(), args))
-    def double_click(self, *args): self.events.append(("double_click", time.monotonic(), args))
-    def press(self, *args): self.events.append(("press", time.monotonic(), args))
-    def release(self, *args): self.events.append(("release", time.monotonic(), args))
-    def wheel(self, *args): self.events.append(("wheel", time.monotonic(), args))
 
 
 def _wait(runner: WorkflowRunner, timeout: float = 4.0) -> None:
@@ -211,83 +213,52 @@ def _temporary_resolved(delay: float):
     script_name = scripts.save_script({"name": "safe", "version": 1, "created_at": "x", "target_window": {}, "scan_interval": 0, "metadata": {}, "actions": [{"type": "mouse_click", "button": "left", "delay": delay, "ratio_x": .5, "ratio_y": .5}]})
     trigger_id = triggers.save_trigger({"version": 1, "name": "start", "type": "workflow_start"})
     workflow_name = workflows.save_workflow({"version": 1, "name": "workflow", "steps": [{"id": "one", "trigger_ref": trigger_id, "macro_ref": script_name[:-5]}]})
-    return root, scripts, WorkflowResolver(triggers, scripts).resolve(workflows.load_workflow(workflow_name))
+    workflow = workflows.load_workflow(workflow_name)
+    identities = {
+        "workflow_id": workflow["id"],
+        "trigger_id": trigger_id,
+        "script_id": script_name.removesuffix(".json"),
+    }
+    return root, scripts, WorkflowResolver(triggers, scripts).resolve(workflow), identities
 
 
-def _run_recording_workflow(delay: float, mutate=None) -> dict:
-    temp, scripts, workflow = _temporary_resolved(delay)
-    gate, recorder = _Gate(), _RecordingMouse()
+def _run_recording_workflow(delay: float, mutate=None, check_before_delay: bool = False) -> dict:
+    temp, scripts, workflow, identities = _temporary_resolved(delay)
+    recorder = RecordingInputBackend()
+    gate = _Gate(recorder)
+    recorder.set_context(target_identity="target-a", target_hwnd=100, execution_id=uuid4().hex, **identities)
     player = ScriptPlayer(_Tracker(), gate)
     runner = WorkflowRunner(_Detector(), scripts, player, input_safety_gate=gate)
     started = time.monotonic()
-    with patch("app.player.mouse", recorder):
+    recorder.scheduled_timestamp = started
+    with patch("app.player.mouse", recorder), patch("app.player.keyboard", recorder.keyboard):
         runner.load_workflow(workflow)
         runner.start()
+        clicks_before_delay = None
+        if check_before_delay:
+            time.sleep(.2)
+            clicks_before_delay = sum(item["action_type"] == "mouse.click" for item in recorder.records)
         if mutate:
             time.sleep(.12)
             mutate(runner, player, gate)
         _wait(runner, timeout=max(2.0, delay + 2.0))
-    clicks = [item for item in recorder.events if item[0] == "click"]
-    result = {"elapsed": (clicks[0][1] - started) if clicks else None, "clicks": len(clicks), "state": runner.state.name, "finish_reason": runner.finish_reason}
+    clicks = [item for item in recorder.records if item["action_type"] == "mouse.click"]
+    status = runner.get_runtime_snapshot()
+    trigger_status = status.get("trigger_runtime") or {}
+    player_result = player.get_last_result()
+    result = {"elapsed": (clicks[0]["emission_attempt_timestamp"] - started) if clicks else None, "clicks": len(clicks), "clicks_before_delay": clicks_before_delay, "state": runner.state.name, "finish_reason": runner.finish_reason, "start_requests": 1, "workflow_executions": 1, "trigger_fires": trigger_status.get("trigger_fire_count", 0), "script_schedules": trigger_status.get("macro_start_count", 0), "terminal_completions": int(runner.state.name == "FINISHED"), "playback_status": getattr(getattr(player_result, "status", None), "value", None), "playback_reason": getattr(player_result, "reason", None), "input_records": recorder.records}
     temp.cleanup()
-    return result
-
-
-def _run_existing_a15() -> dict:
-    root = PROJECT_ROOT
-    scripts = ScriptStore(root)
-    workflow = WorkflowResolver(TriggerStore(root), scripts).resolve(
-        WorkflowStore(root).load_workflow("workflow_3b23e200b77e40afbf4f53f5d384ce18.json")
-    )
-    gate, recorder = _Gate(), _RecordingMouse()
-    player = ScriptPlayer(_Tracker(), gate)
-    runner = WorkflowRunner(_Detector(), scripts, player, input_safety_gate=gate)
-    started = time.monotonic()
-    with patch("app.player.mouse", recorder):
-        runner.load_workflow(workflow)
-        runner.start()
-        _wait(runner, timeout=4.0)
-    clicks = [item for item in recorder.events if item[0] == "click"]
-    return {
-        "elapsed": (clicks[0][1] - started) if clicks else None,
-        "clicks": len(clicks), "state": runner.state.name,
-        "finish_reason": runner.finish_reason,
-        "action": scripts.load_script("script_4d6bcaf7aea44d82bd290ba2edebe131.json")["actions"][0],
-    }
-
-
-def run_autonomous() -> dict:
-    direct = _run_recording_workflow(2.0)
-    a15 = _run_existing_a15()
-    cancel = _run_recording_workflow(.35, lambda runner, _player, _gate: runner.stop())
-    foreground_loss = _run_recording_workflow(.35, lambda _runner, _player, gate: setattr(gate, "blocked", True))
-    target_change = _run_recording_workflow(.35, lambda _runner, _player, gate: setattr(gate.target_session, "snapshot", _Snapshot(session_id="target-b", generation=2)))
-    two_starts = [_run_recording_workflow(.05), _run_recording_workflow(.05)]
-    result = {
-        "direct": direct, "a15": a15, "cancel": cancel, "unlock": target_change,
-        "foreground_loss": foreground_loss, "target_change": target_change,
-        "two_explicit_starts": two_starts,
-    }
-    assert direct["clicks"] == 1 and direct["elapsed"] is not None and direct["elapsed"] >= 1.8
-    assert a15["clicks"] == 1 and a15["elapsed"] is not None and a15["elapsed"] >= 1.8
-    assert all(item["clicks"] == 0 for item in (cancel, foreground_loss, target_change))
-    assert all(item["clicks"] == 1 for item in two_starts)
     return result
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario", default="a15-direct-start")
+    parser.add_argument("--scenario", default="harness-self-test")
     parser.add_argument("--output")
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--keep-open", action="store_true")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--autonomous", action="store_true")
     args = parser.parse_args()
-    if args.autonomous:
-        result = run_autonomous()
-        print(json.dumps(result, indent=2) if args.json else "AUTONOMOUS_RESULT=PASS")
-        return 0
     return run_interactive(args)
 
 

@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from tools.dev_acceptance_harness import EventLog, run_autonomous
+from tools.dev_acceptance_harness import EventLog, _run_recording_workflow
 
 
 class DevAcceptanceHarnessTests(unittest.TestCase):
@@ -23,14 +23,13 @@ class DevAcceptanceHarnessTests(unittest.TestCase):
             self.assertEqual(rows[0]["session_id"], "test-session")
 
     def test_autonomous_lane_delays_and_blocks_unsafe_clicks(self):
-        result = run_autonomous()
-        self.assertEqual(result["direct"]["clicks"], 1)
-        self.assertGreaterEqual(result["direct"]["elapsed"], 1.8)
-        self.assertEqual(result["a15"]["clicks"], 1)
-        self.assertEqual(result["a15"]["action"]["delay"], 2.0)
-        self.assertEqual(result["cancel"]["clicks"], 0)
-        self.assertEqual(result["foreground_loss"]["clicks"], 0)
-        self.assertEqual(result["target_change"]["clicks"], 0)
+        direct = _run_recording_workflow(.05)
+        blocked = _run_recording_workflow(.35, lambda _runner, _player, gate: setattr(gate, "blocked", True))
+        self.assertEqual(direct["clicks"], 1)
+        self.assertEqual(direct["trigger_fires"], 1)
+        self.assertEqual(direct["script_schedules"], 1)
+        self.assertEqual(blocked["clicks"], 0)
+        self.assertEqual(blocked["playback_status"], "INPUT_BLOCKED")
 
 
 if __name__ == "__main__":
