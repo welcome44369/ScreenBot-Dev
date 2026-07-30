@@ -125,11 +125,19 @@ def run_interactive(args) -> int:
     print(f"OUTPUT={output}", flush=True)
 
     def finish() -> None:
+        if observer.count:
+            result = "FAIL"
+        elif target.count == 0:
+            result = "INCOMPLETE"
+        elif target.count == 1:
+            result = "PASS"
+        else:
+            result = "FAIL"
         summary = {
             "session_id": session_id, "scenario": args.scenario,
             "target_click_count": target.count, "observer_click_count": observer.count,
             "event_log": str(log.path),
-            "result": "PASS" if target.count <= 1 and observer.count == 0 else "FAIL",
+            "result": result,
         }
         (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
         print(f"HARNESS_RESULT={summary['result']}", flush=True)
