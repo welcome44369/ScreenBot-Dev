@@ -80,7 +80,10 @@ class AcceptanceWindow:
             self.session_label = tk.Label(self.window, text=f"Session: {log.session_id}")
             self.session_label.pack(pady=3)
             self.button = tk.Button(self.window, text="SAFE CLICK AREA", font=("Segoe UI", 16, "bold"), width=28, height=5)
-            self.button.pack(expand=True)
+            # The production action is target-relative (0.5, 0.5), so the
+            # receiving area must include the exact client centre rather than
+            # merely be visually central within the remaining packed layout.
+            self.button.place(relx=0.5, rely=0.5, anchor="center")
             self.button.bind("<Button-1>", self._click)
         else:
             self.heading.configure(text="SCREENBOT DEV SAFETY OBSERVER")
