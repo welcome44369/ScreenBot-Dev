@@ -111,6 +111,7 @@ class ScreenBotApp:
         self.workflow_data = None
         self.selected_workflow_filename = None
         self.workflow_ui_state = "IDLE"
+        self.workflow_execution_ui_state = "IDLE_EXPANDED"
         self._workflow_editor = None  # single editor instance guard
         self._workflow_debug_panel = None
         self._trigger_manager = None
@@ -450,6 +451,14 @@ class ScreenBotApp:
             self._refresh_handoff_presentation()
             return False
 
+        if not self._collapse_ui_for_workflow_execution():
+            transition = self.start_handoff.cancel("collapse_failed")
+            self._record_start_handoff_event(
+                "START_REQUEST_COLLAPSE_FAILED", transition.snapshot, request=request
+            )
+            self._restore_ui_after_workflow_execution("collapse_failed")
+            return False
+
         self.set_state(AppState.IDLE)
         self.start_handoff_timer.start()
         diagnostics = getattr(self, "workflow_process_diagnostics", None)
@@ -463,6 +472,48 @@ class ScreenBotApp:
         # If Windows/Qt activated another root, the attempt safely remains ARMED.
         self._attempt_start_handoff()
         return True
+
+    def _collapse_ui_for_workflow_execution(self):
+        """Perform and acknowledge the one-shot UI collapse before handoff."""
+        if self.workflow_execution_ui_state in {
+            "COLLAPSING", "COLLAPSED_ARMED", "RUNNING_COLLAPSED"
+        }:
+            return True
+        self.workflow_execution_ui_state = "COLLAPSING"
+        collapse = getattr(self.widget, "collapse_for_workflow_execution", None)
+        if not callable(collapse):
+            self.logger.error("Workflow start blocked: widget has no collapse acknowledgement")
+            self.workflow_execution_ui_state = "IDLE_EXPANDED"
+            return False
+        try:
+            collapsed = bool(collapse())
+            QApplication.processEvents()
+            acknowledged = getattr(self.widget, "is_workflow_execution_collapsed", lambda: False)()
+        except (RuntimeError, TypeError) as exc:
+            self.logger.error("Workflow UI collapse failed: %s", exc)
+            collapsed = acknowledged = False
+        if not (collapsed and acknowledged):
+            self.workflow_execution_ui_state = "IDLE_EXPANDED"
+            return False
+        self.workflow_execution_ui_state = "COLLAPSED_ARMED"
+        self._record_overlay_diagnostic("WORKFLOW_UI_COLLAPSED")
+        return True
+
+    def _restore_ui_after_workflow_execution(self, reason):
+        """Restore once for every terminal/cancelled/failed start path."""
+        if self.workflow_execution_ui_state == "IDLE_EXPANDED":
+            return True
+        self.workflow_execution_ui_state = "RESTORING"
+        restore = getattr(self.widget, "restore_after_workflow_execution", None)
+        restored = False
+        try:
+            restored = bool(restore()) if callable(restore) else False
+            QApplication.processEvents()
+        except (RuntimeError, TypeError) as exc:
+            self.logger.error("Workflow UI restore failed: %s", exc)
+        self.workflow_execution_ui_state = "IDLE_EXPANDED"
+        self._record_overlay_diagnostic("WORKFLOW_UI_RESTORED", reason=reason, restored=restored)
+        return restored
 
     def _on_start_handoff_tick(self):
         self._attempt_start_handoff()
@@ -480,6 +531,7 @@ class ScreenBotApp:
             self._record_start_handoff_event(
                 "START_REQUEST_TIMED_OUT", expired.snapshot, request=expired.request
             )
+            self._restore_ui_after_workflow_execution("start_request_timed_out")
             self._refresh_handoff_presentation()
             return
 
@@ -494,6 +546,7 @@ class ScreenBotApp:
             self._record_start_handoff_event(
                 "START_REQUEST_TARGET_UNAVAILABLE", transition.snapshot, request=transition.request
             )
+            self._restore_ui_after_workflow_execution("target_refresh_failed")
             self._refresh_handoff_presentation()
             return
 
@@ -507,6 +560,7 @@ class ScreenBotApp:
             self._record_start_handoff_event(
                 "START_REQUEST_TARGET_CHANGED", transition.snapshot, request=transition.request
             )
+            self._restore_ui_after_workflow_execution("target_changed")
             self._refresh_handoff_presentation()
             return
 
@@ -520,6 +574,7 @@ class ScreenBotApp:
             self._record_start_handoff_event(
                 "START_REQUEST_TARGET_CHANGED", transition.snapshot, request=transition.request
             )
+            self._restore_ui_after_workflow_execution("target_changed")
             self._refresh_handoff_presentation()
             return
 
@@ -554,6 +609,7 @@ class ScreenBotApp:
             self._record_start_handoff_event(
                 "START_REQUEST_TARGET_UNAVAILABLE", transition.snapshot, request=transition.request
             )
+            self._restore_ui_after_workflow_execution(fast.code.value)
             self._refresh_handoff_presentation()
             return
 
@@ -591,6 +647,7 @@ class ScreenBotApp:
                 else "START_REQUEST_TARGET_UNAVAILABLE"
             )
             self._record_start_handoff_event(event, transition.snapshot, request=transition.request)
+            self._restore_ui_after_workflow_execution(first_authorization.code.value)
             self._refresh_handoff_presentation()
             return
 
@@ -630,6 +687,7 @@ class ScreenBotApp:
                 request=completed.request,
                 authorization=final_authorization,
             )
+            self._restore_ui_after_workflow_execution(final_authorization.code.value)
             self._refresh_handoff_presentation()
             return
 
@@ -654,11 +712,13 @@ class ScreenBotApp:
             self._record_start_handoff_event(
                 "START_REQUEST_STARTED", completed.snapshot, request=completed.request
             )
+            self.workflow_execution_ui_state = "RUNNING_COLLAPSED"
         else:
             completed = self.start_handoff.complete_failed(request.request_id, failure_reason)
             self._record_start_handoff_event(
                 "START_REQUEST_FAILED", completed.snapshot, request=completed.request
             )
+            self._restore_ui_after_workflow_execution(failure_reason or "start_failed")
         self._record_overlay_diagnostic(
             "START_REQUEST_STARTED" if started else "START_REQUEST_FAILED",
             request_id=request.request_id,
@@ -682,6 +742,7 @@ class ScreenBotApp:
         self._record_start_handoff_event(
             "START_REQUEST_CANCELLED", transition.snapshot, request=transition.request
         )
+        self._restore_ui_after_workflow_execution(reason)
         self.set_state(AppState.IDLE)
         self._refresh_handoff_presentation()
         return True
@@ -701,6 +762,7 @@ class ScreenBotApp:
             if unavailable else "START_REQUEST_TARGET_CHANGED"
         )
         self._record_start_handoff_event(event, transition.snapshot, request=transition.request)
+        self._restore_ui_after_workflow_execution(reason)
         self._refresh_handoff_presentation()
         return True
 
@@ -1096,6 +1158,7 @@ class ScreenBotApp:
         self.workflow_ui_state = "STOPPED"
         self.workflow_diagnostics.mark_workflow_stopped()
         self.widget.set_workflow_running(False)
+        self._restore_ui_after_workflow_execution("workflow_stopped")
         self.logger.info("Workflow stopped")
         self._update_workflow_runtime_ui()
 
@@ -1816,6 +1879,11 @@ class ScreenBotApp:
         }
         self.widget.set_workflow_runtime_info(info)
         self.widget.set_workflow_running(status in {"STARTING", "WAIT_TRIGGER", "RUNNING_MACRO", "STOPPING"})
+        if (
+            self.workflow_execution_ui_state == "RUNNING_COLLAPSED"
+            and snapshot.get("state") in {"FINISHED", "STOPPED", "ERROR"}
+        ):
+            self._restore_ui_after_workflow_execution(snapshot.get("state", "terminal").lower())
         self._refresh_handoff_presentation()
 
     def _handle_player_error(self, reason):
@@ -1824,6 +1892,7 @@ class ScreenBotApp:
     def _on_player_error(self, reason):
         self.set_state(AppState.ERROR)
         self._show_message("播放錯誤", reason)
+        self._restore_ui_after_workflow_execution("player_error")
         self.set_state(AppState.IDLE)
 
     def _handle_player_finished(self):
@@ -1831,6 +1900,7 @@ class ScreenBotApp:
 
     def _on_player_finished(self):
         if self.state in {AppState.RUNNING, AppState.PAUSED}:
+            self._restore_ui_after_workflow_execution("player_finished")
             self.set_state(AppState.IDLE)
 
     def _show_message(self, title, text):

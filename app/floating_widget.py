@@ -93,6 +93,8 @@ class FloatingWidget(QWidget):
         self.drag_started = False
         self.expanded = False
         self.runtime_debug_expanded = False
+        self._workflow_execution_collapsed = False
+        self._workflow_previous_expanded = False
         self._compact_status_view = None
         self._native_no_activate_adapter = native_no_activate_adapter or WindowsNoActivateAdapter(
             observer=overlay_diagnostics
@@ -660,6 +662,8 @@ class FloatingWidget(QWidget):
         super().mouseReleaseEvent(event)
 
     def toggle_panel(self):
+        if self._workflow_execution_collapsed:
+            return
         self.expanded = not self.expanded
         if self._diagnostics_enabled():
             self._overlay_diagnostics.observe_ui_event(
@@ -671,6 +675,38 @@ class FloatingWidget(QWidget):
         self.adjustSize()
         if self.expanded and not self.runtime_debug_expanded:
             self._compact_height = self.height()
+
+    def collapse_for_workflow_execution(self):
+        """Collapse the expanded controls before a workflow can be committed.
+
+        This is intentionally a presentation-only transition: it does not
+        activate, move, raise, hide, or otherwise alter any target window.
+        """
+        if self._workflow_execution_collapsed:
+            return True
+        self._workflow_previous_expanded = bool(self.expanded)
+        self._workflow_execution_collapsed = True
+        self.expanded = False
+        self.runtime_debug_expanded = False
+        for item in self._runtime_debug_widgets:
+            item.setVisible(False)
+        self.runtime_debug_toggle.setText("▶ Runtime Debug")
+        self.details_widget.setVisible(False)
+        self.adjustSize()
+        return not self.details_widget.isVisible()
+
+    def restore_after_workflow_execution(self):
+        """Restore the pre-start panel presentation exactly once."""
+        if not self._workflow_execution_collapsed:
+            return True
+        self._workflow_execution_collapsed = False
+        self.expanded = self._workflow_previous_expanded
+        self.details_widget.setVisible(self.expanded)
+        self.adjustSize()
+        return self.details_widget.isVisible() == self.expanded
+
+    def is_workflow_execution_collapsed(self):
+        return self._workflow_execution_collapsed and not self.details_widget.isVisible()
 
     def toggle_runtime_debug(self):
         self.runtime_debug_expanded = not self.runtime_debug_expanded

@@ -320,16 +320,24 @@ class StartHandoffTests(unittest.TestCase):
             get_capture_runtime_diagnostics=lambda: {},
         )
         app.window_tracker = SimpleNamespace(target=SimpleNamespace(title="Target A"))
-        app.widget = SimpleNamespace(set_workflow_running=lambda *_: None)
-        app.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None)
+        collapsed = {"value": False}
+        app.widget = SimpleNamespace(
+            set_workflow_running=lambda *_: None,
+            collapse_for_workflow_execution=lambda: collapsed.__setitem__("value", True) or True,
+            is_workflow_execution_collapsed=lambda: collapsed["value"],
+            restore_after_workflow_execution=lambda: collapsed.__setitem__("value", False) or True,
+        )
+        app.logger = SimpleNamespace(info=lambda *_args, **_kwargs: None, error=lambda *_args, **_kwargs: None)
         app.state = AppState.IDLE
         app.workflow_data = None
         app.workflow_ui_state = "IDLE"
+        app.workflow_execution_ui_state = "IDLE_EXPANDED"
         app.stop_text_trigger = lambda: None
         app._update_workflow_runtime_ui = lambda: None
         app._refresh_handoff_presentation = lambda: None
         app.set_state = lambda state: setattr(app, "state", state)
         app._record_start_handoff_event = lambda *_args, **_kwargs: None
+        app._record_overlay_diagnostic = lambda *_args, **_kwargs: None
         return app
 
     def test_application_direct_path_commits_in_the_start_click(self):

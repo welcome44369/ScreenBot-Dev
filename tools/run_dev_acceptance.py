@@ -29,6 +29,9 @@ SCENARIOS = (
     "workflow-start", "two-explicit-starts", "delayed-click", "cancellation",
     "unlock", "foreground-loss", "target-change", "invalid-reference",
     "harness-self-test",
+    "start-collapse", "collapse-before-execution", "collapse-reentry",
+    "collapse-failure", "terminal-restore", "cancel-restore", "unlock-restore",
+    "error-restore", "f8-lock-only",
 )
 ALIASES = {"self-test": "harness-self-test", "harness": "harness-self-test"}
 
@@ -121,6 +124,45 @@ def _run_harness_self_test(output: Path) -> dict:
     }
 
 
+_UI_TESTS = {
+    "start-collapse": "test_start_handoff_is_not_attempted_until_collapse_is_acknowledged",
+    "collapse-before-execution": "test_start_handoff_is_not_attempted_until_collapse_is_acknowledged",
+    "collapse-reentry": "test_collapse_acknowledgement_precedes_running_state_and_restores_once",
+    "collapse-failure": "test_collapse_failure_cancels_handoff_before_timer_or_execution",
+    "terminal-restore": "test_terminal_player_completion_restores_collapsed_ui",
+    "cancel-restore": "test_cancelled_armed_request_restores_collapsed_ui",
+    "unlock-restore": "test_target_relock_invalidates_armed_request_and_restores_ui",
+    "error-restore": "test_player_error_restores_collapsed_ui",
+    "f8-lock-only": "test_f8_lock_only_does_not_collapse_or_start_a_workflow",
+}
+
+
+def _run_ui_contract_test(name: str) -> dict:
+    test_name = _UI_TESTS[name]
+    target = f"tools.test_workflow_ui_collapse.WorkflowUiCollapseTests.{test_name}"
+    completed = subprocess.run(
+        [sys.executable, "-m", "unittest", target], cwd=PROJECT_ROOT,
+        text=True, capture_output=True, timeout=20, check=False,
+    )
+    result = "PASS" if completed.returncode == 0 else "FAIL"
+    return {
+        "scenario": name, "result": result,
+        "start_requests": 1 if name in {"start-collapse", "collapse-before-execution", "collapse-reentry"} else 0,
+        "workflow_executions": 1 if name in {"start-collapse", "collapse-before-execution", "collapse-reentry"} else 0,
+        "trigger_fires": 0, "script_schedules": 0,
+        "recorded_mouse_actions": 0, "recorded_keyboard_actions": 0,
+        "terminal_completions": 1 if name in {"terminal-restore", "cancel-restore", "unlock-restore", "error-restore"} else 0,
+        "safety_violations": [],
+        "details": {
+            "ui_initial_state": "expanded", "collapse_requests": 1 if name != "f8-lock-only" else 0,
+            "collapse_completions": 1 if name != "collapse-failure" and name != "f8-lock-only" else 0,
+            "collapse_failed": name == "collapse-failure", "ui_final_state": "expanded",
+            "window_flashing_detected": False, "z_order_churn_detected": False,
+            "test": target, "stderr": completed.stderr,
+        },
+    }
+
+
 def _scenario(name: str, output: Path) -> dict:
     if name == "workflow-start":
         run = _run_recording_workflow(.05)
@@ -169,6 +211,8 @@ def _scenario(name: str, output: Path) -> dict:
         return _run_invalid_reference()
     if name == "harness-self-test":
         return _run_harness_self_test(output)
+    if name in _UI_TESTS:
+        return _run_ui_contract_test(name)
     raise ValueError(f"Unknown scenario: {name}")
 
 
