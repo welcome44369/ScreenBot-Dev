@@ -838,10 +838,15 @@ class WorkflowRunner:
                 raise ValueError(f"Workflow step {step_id} missing macro filename")
 
             trigger_norm = dict(trigger)
-            min_absent_duration_ms = trigger_norm.get("min_absent_duration_ms", 5000)
-            if not isinstance(min_absent_duration_ms, int) or min_absent_duration_ms < 0:
-                raise ValueError(f"Workflow step {step_id} min_absent_duration_ms must be integer >= 0")
-            trigger_norm["min_absent_duration_ms"] = min_absent_duration_ms
+            # ``min_absent_duration_ms`` belongs to the OCR text-trigger
+            # contract.  Do not enrich non-text triggers with text polling
+            # fields: TriggerRunner intentionally rejects those fields for
+            # workflow_start.
+            if trigger_type == "text":
+                min_absent_duration_ms = trigger_norm.get("min_absent_duration_ms", 5000)
+                if not isinstance(min_absent_duration_ms, int) or min_absent_duration_ms < 0:
+                    raise ValueError(f"Workflow step {step_id} min_absent_duration_ms must be integer >= 0")
+                trigger_norm["min_absent_duration_ms"] = min_absent_duration_ms
             normalized_steps.append({"id": step_id, "trigger": trigger_norm, "macro": macro})
 
         normalized = {"name": name, "steps": normalized_steps}
