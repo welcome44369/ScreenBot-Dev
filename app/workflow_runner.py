@@ -617,11 +617,12 @@ class WorkflowRunner:
     def _build_trigger_data(self, step):
         trigger = dict(step["trigger"])
         trigger.setdefault("type", "text")
-        trigger.setdefault("region", {"x_ratio": 0.0, "y_ratio": 0.0, "width_ratio": 1.0, "height_ratio": 1.0})
-        trigger.setdefault("poll_interval_ms", 500)
-        trigger.setdefault("confirm_frames", 2)
-        trigger.setdefault("cooldown_ms", 1000)
-        trigger.setdefault("min_absent_duration_ms", 5000)
+        if trigger.get("type") == "text":
+            trigger.setdefault("region", {"x_ratio": 0.0, "y_ratio": 0.0, "width_ratio": 1.0, "height_ratio": 1.0})
+            trigger.setdefault("poll_interval_ms", 500)
+            trigger.setdefault("confirm_frames", 2)
+            trigger.setdefault("cooldown_ms", 1000)
+            trigger.setdefault("min_absent_duration_ms", 5000)
         return {
             "name": f"{self.workflow['name']}::{step['id']}",
             "trigger": trigger,
@@ -818,17 +819,19 @@ class WorkflowRunner:
             trigger = step.get("trigger")
             if not isinstance(trigger, dict):
                 raise ValueError(f"Workflow step {step_id} missing trigger")
-            if trigger.get("type", "text") != "text":
-                raise ValueError(f"Workflow step {step_id} supports only text trigger")
-            normalize_condition(trigger.get("condition"), trigger.get("event"))
-            if not isinstance(trigger.get("text"), str) or not trigger["text"]:
-                raise ValueError(f"Workflow step {step_id} requires non-empty trigger text")
-            region = trigger.get("region")
-            if not isinstance(region, dict):
-                raise ValueError(f"Workflow step {step_id} missing trigger region")
-            for k in ("x_ratio", "y_ratio", "width_ratio", "height_ratio"):
-                if not isinstance(region.get(k), (int, float)):
-                    raise ValueError(f"Workflow step {step_id} region {k} must be numeric")
+            trigger_type = trigger.get("type", "text")
+            if trigger_type not in {"text", "workflow_start"}:
+                raise ValueError(f"Workflow step {step_id} has unsupported trigger type")
+            if trigger_type == "text":
+                normalize_condition(trigger.get("condition"), trigger.get("event"))
+                if not isinstance(trigger.get("text"), str) or not trigger["text"]:
+                    raise ValueError(f"Workflow step {step_id} requires non-empty trigger text")
+                region = trigger.get("region")
+                if not isinstance(region, dict):
+                    raise ValueError(f"Workflow step {step_id} missing trigger region")
+                for k in ("x_ratio", "y_ratio", "width_ratio", "height_ratio"):
+                    if not isinstance(region.get(k), (int, float)):
+                        raise ValueError(f"Workflow step {step_id} region {k} must be numeric")
 
             macro = step.get("macro")
             if not isinstance(macro, str) or not macro.strip():

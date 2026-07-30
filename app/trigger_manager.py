@@ -3,11 +3,48 @@
 The dialog deliberately delegates OCR execution and region capture to the
 existing application/editor facilities; it only edits the Trigger resource.
 """
-from PySide6.QtWidgets import QVBoxLayout, QHBoxLayout, QListWidget, QPushButton, QMessageBox, QInputDialog, QDialog
+from PySide6.QtWidgets import QVBoxLayout, QHBoxLayout, QListWidget, QPushButton, QMessageBox, QInputDialog, QDialog, QFormLayout, QLineEdit
 from PySide6.QtCore import Qt
 from app.trigger_wizard import TriggerWizard
 from app.dialog_utils import show_warning
 from app.manager_window_base import ManagerWindowBase
+
+
+class WorkflowStartTriggerDialog(QDialog):
+    """Minimal editor for a trigger fired only by an explicit workflow Start."""
+
+    def __init__(self, trigger_store, data=None, parent=None):
+        super().__init__(parent)
+        self.store = trigger_store
+        self.data = data
+        self.setWindowTitle("Workflow Start Trigger")
+        form = QFormLayout(self)
+        self.name_edit = QLineEdit((data or {}).get("name", ""))
+        form.addRow("Name", self.name_edit)
+        save = QPushButton("Save")
+        cancel = QPushButton("Cancel")
+        buttons = QHBoxLayout()
+        buttons.addWidget(save)
+        buttons.addWidget(cancel)
+        form.addRow(buttons)
+        save.clicked.connect(self._save)
+        cancel.clicked.connect(self.reject)
+
+    def _save(self):
+        name = self.name_edit.text().strip()
+        if not name:
+            show_warning(self, "Invalid Trigger", "Name is required.")
+            return
+        try:
+            if self.data is None:
+                self.store.save_trigger({"version": 1, "name": name, "type": "workflow_start"})
+            else:
+                payload = dict(self.data)
+                payload["name"] = name
+                self.store.update_trigger(payload["id"], payload)
+            self.accept()
+        except Exception as exc:
+            show_warning(self, "Trigger save failed", str(exc))
 
 
 class TriggerManager(ManagerWindowBase):
@@ -37,6 +74,16 @@ class TriggerManager(ManagerWindowBase):
             self.list_widget.item(self.list_widget.count() - 1).setData(32, item["id"])
 
     def _new(self):
+        trigger_type, ok = QInputDialog.getItem(
+            self, "New Trigger", "Type:", ["Workflow Start", "Text (OCR)"], 0, False
+        )
+        if not ok:
+            return
+        if trigger_type == "Workflow Start":
+            dialog = WorkflowStartTriggerDialog(self.store, parent=self)
+            dialog.finished.connect(lambda _result: self.refresh())
+            dialog.exec()
+            return
         if self.window_tracker is not None and self.text_detector is not None:
             wizard = TriggerWizard(self.store, self.window_tracker, self.text_detector, self)
             if callable(self.on_select_start): self.on_select_start()
@@ -62,6 +109,11 @@ class TriggerManager(ManagerWindowBase):
             return
         trigger_id = item.data(32)
         data = self.store.load_trigger(trigger_id)
+        if data.get("type") == "workflow_start":
+            dialog = WorkflowStartTriggerDialog(self.store, data=data, parent=self)
+            dialog.finished.connect(lambda _result: self.refresh())
+            dialog.exec()
+            return
         text, ok = QInputDialog.getText(self, "編輯 Trigger", "偵測文字:", text=data["text"])
         if ok and text.strip():
             data["text"] = text.strip()

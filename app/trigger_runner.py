@@ -30,8 +30,9 @@ class TriggerRunner:
         self.logger = logger or logging.getLogger("ScreenBot")
         self.trigger_data = self._validate_trigger_data(trigger_data)
         trigger_config = self.trigger_data["trigger"]
+        self.trigger_type = trigger_config.get("type", "text")
         self._condition_memory = condition_memory
-        self.text_trigger = self._new_text_trigger()
+        self.text_trigger = self._new_text_trigger() if self.trigger_type == "text" else None
         self._foreground_restored = True
         self._thread = None
         self._stop_event = threading.Event()
@@ -100,6 +101,9 @@ class TriggerRunner:
         return self._thread is not None and self._thread.is_alive()
 
     def _run(self):
+        if self.trigger_type == "workflow_start":
+            self._run_workflow_start()
+            return
         while not self._stop_event.is_set():
             try:
                 # A step runner owns exactly one trigger fire.  Player and
@@ -198,6 +202,7 @@ class TriggerRunner:
                     break
                 self._publish_status()
                 self._wait_interval()
+
             except Exception as exc:
                 with self._status_lock:
                     self._last_error = str(exc)
@@ -209,6 +214,52 @@ class TriggerRunner:
                     self._stop_event.set()
                     break
                 self._wait_interval()
+
+    def _run_workflow_start(self):
+        """Schedule exactly once for the explicit workflow Start that owns us."""
+        try:
+            if self._stop_event.is_set() or self._trigger_fired:
+                return
+            if self._input_safety_gate is not None:
+                authorization = self._input_safety_gate.authorize_foreground_input(
+                    self._expected_target_session
+                )
+                if not authorization.allowed:
+                    self._last_authorization = authorization
+                    self._last_error = f"target_unavailable:{authorization.code.value}"
+                    self._stop_event.set()
+                    self._publish_status()
+                    return
+            if callable(self._can_start_macro) and not self._can_start_macro():
+                self._last_error = "macro_start_blocked"
+                self._stop_event.set()
+                self._publish_status()
+                return
+            macro_script = self._get_macro_script()
+            start_result = self.player.start(
+                macro_script, expected_target=self._expected_target_session
+            )
+            if start_result.status.name == "INPUT_BLOCKED":
+                self._input_blocked_reason = start_result.reason
+                if callable(self._on_input_blocked):
+                    self._on_input_blocked(start_result.reason)
+                self._stop_event.set()
+                self._publish_status()
+                return
+            if start_result.status.name != "STARTED":
+                raise RuntimeError(start_result.reason or start_result.status.value)
+            self._macro_running = True
+            self._macro_started_at = time.monotonic()
+            self._trigger_fire_count = 1
+            self._macro_start_count = 1
+            self._trigger_fired = True
+            self._publish_status()
+        except Exception as exc:
+            with self._status_lock:
+                self._last_error = str(exc)
+            self.logger.exception("Workflow-start trigger failed")
+            self._stop_event.set()
+            self._publish_status()
 
     def _wait_interval(self):
         self._stop_event.wait(self._poll_interval_ms / 1000.0)
@@ -249,7 +300,7 @@ class TriggerRunner:
     def get_status_snapshot(self):
         with self._status_lock:
             result = self._last_result
-            trigger_status = self.text_trigger.get_status_snapshot()
+            trigger_status = self.text_trigger.get_status_snapshot() if self.text_trigger else {}
             return {
                 "active": self.is_active(),
                 "macro_running": self._macro_running,
@@ -273,7 +324,7 @@ class TriggerRunner:
                     "present": result.present if result else trigger_status.get("last_present"),
                 },
                 "trigger_status": trigger_status,
-                "trigger_text": self.trigger_data["trigger"]["text"],
+                "trigger_text": self.trigger_data["trigger"].get("text"),
                 "trigger_event": self.trigger_data["trigger"].get("event"),
                 "trigger_condition": self.trigger_data["trigger"].get("condition"),
                 "macro": self.trigger_data["macro"],
@@ -353,8 +404,25 @@ class TriggerRunner:
         trigger = trigger_data.get("trigger")
         if not isinstance(trigger, dict):
             raise ValueError("Trigger config missing trigger block")
-        if trigger.get("type") != "text":
-            raise ValueError("Only text triggers are supported")
+        trigger_type = trigger.get("type", "text")
+        if trigger_type == "workflow_start":
+            forbidden = {
+                "event", "text", "texts", "region", "poll_interval_ms",
+                "confirm_frames", "cooldown_ms", "min_absent_duration_ms",
+                "match_mode", "observation", "confidence", "image_path",
+                "retry_count", "timeout_polling", "auto_start", "repeat",
+                "poll", "delay", "retry", "run_on_lock", "run_on_focus",
+            }
+            present = sorted(key for key in forbidden if key in trigger)
+            if present:
+                raise ValueError(
+                    "workflow_start trigger must not contain: " + ", ".join(present)
+                )
+            if not isinstance(trigger_data.get("macro"), str) or not trigger_data["macro"].strip():
+                raise ValueError("Trigger config missing macro filename")
+            return trigger_data
+        if trigger_type != "text":
+            raise ValueError("Only text and workflow_start triggers are supported")
         normalize_condition(trigger.get("condition"), trigger.get("event"))
         if not isinstance(trigger.get("text"), str) or not trigger["text"]:
             raise ValueError("Trigger text must be non-empty")

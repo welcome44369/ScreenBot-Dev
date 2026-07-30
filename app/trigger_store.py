@@ -1,4 +1,4 @@
-"""Persistent, runtime-agnostic storage for OCR text triggers."""
+"""Persistent, runtime-agnostic storage for workflow and OCR text triggers."""
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -94,8 +94,31 @@ class TriggerStore:
         for key in ("id", "name"):
             if not isinstance(data.get(key), str) or not data[key].strip():
                 raise ValueError(f"Trigger {key} must be non-empty")
-        if data.get("type", "text") != "text":
-            raise ValueError("Trigger type must be 'text'")
+        # ID-less/type-less persisted text triggers predate the resource model.
+        # Preserve their established text compatibility while rejecting unknown
+        # explicit types.
+        trigger_type = data.get("type", "text")
+        if trigger_type not in {"text", "workflow_start"}:
+            raise ValueError("Trigger type must be 'text' or 'workflow_start'")
+        if trigger_type == "workflow_start":
+            # This trigger is consumed only by an explicit workflow Start. It
+            # intentionally has neither observation nor timing configuration.
+            forbidden = {
+                "event", "text", "texts", "region", "poll_interval_ms",
+                "confirm_frames", "cooldown_ms", "min_absent_duration_ms",
+                "match_mode", "observation", "confidence", "image_path",
+                "retry_count", "timeout_polling", "auto_start", "repeat",
+                "poll", "delay", "retry", "run_on_lock", "run_on_focus",
+            }
+            present = sorted(key for key in forbidden if key in data)
+            if present:
+                raise ValueError(
+                    "workflow_start trigger must not contain: " + ", ".join(present)
+                )
+            result = dict(data)
+            result["version"] = int(data.get("version", 1))
+            result["type"] = "workflow_start"
+            return result
         if data.get("event") not in {"appear", "disappear"}:
             raise ValueError("Trigger event must be 'appear' or 'disappear'")
         texts = data.get("texts")
