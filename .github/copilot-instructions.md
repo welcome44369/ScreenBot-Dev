@@ -1,91 +1,21 @@
-# ScreenBot Workspace Instructions
+# ScreenBot Dev instructions
 
-You are working on the ScreenBot project.
-
-This is a Python desktop automation application.
-
-## General Rules
-
-Implement only what is requested.
-
-Do not redesign the UI.
-
-Do not add extra features.
-
-Do not refactor unrelated code.
-
-Ask before making assumptions.
-
-## File Operations
-
-Always use workspace relative paths.
-
-Correct:
-
-./app/application.py
-
-./app/floating_widget.py
-
-Never use:
-
-/app/application.py
-
-Modify existing files only.
-
-Do not create new files unless explicitly requested.
-
-Never rewrite an entire file.
-
-Only edit the necessary section.
-
-## Workflow
-
-Read before Edit.
-
-Read again after Edit.
-
-If Edit fails:
-
-Read again and retry.
-
-Do not stop after the first failure.
-
-## Validation
-
-Run:
-
-python -m compileall app
-
-before finishing.
-
-## Final Report
-
-Always report:
-
-PASS / FAIL
-
-Modified files
-
-Summary
-
-Validation result
-
-## Project Documentation
-
-Before implementing a task, use the Read tool to read:
-
-- ./docs/project-handoff.md
-- ./docs/architecture.md
-- ./docs/ai-workflow.md
-
-Use:
-
-- ./docs/task-template.md
-
-as the preferred task structure.
-
-Do not update:
-
-- ./docs/changelog.md
-
-unless the current task explicitly requests it.
+- Work only in `F:\ScreenBot_dev` on `dev/screenbot-next`.
+- Official repository is `https://github.com/welcome44369/ScreenBot-Dev.git`;
+  push only to `origin`.
+- `screenbot-readonly` is historical reference. Never push to it or develop in
+  Stable/Legacy worktrees.
+- Read `docs/GITHUB_COPILOT_HANDOFF.md` before modifying code.
+- Protect TargetSession, overlay ownership, Z-order/topmost/flashing fixes,
+  foreground handoff, F8 semantics, and the foreground input gate.
+- Start requires UI-collapse acknowledgement before workflow execution. F8 is
+  lock/unlock only; it never starts a workflow.
+- Use temporary Runtime plus Recording Input Backend for autonomous tests.
+  Never use formal A15 Runtime in `all-non-input` and never commit Runtime JSON.
+- Do not claim background input while global foreground-gated input is used.
+- Stage exact files only. Do not use `git add .`, reset, restore, clean, rebase,
+  force push, or push to `screenbot-readonly`.
+- After Workflow, Trigger, ScriptPlayer, start-handoff, or UI-collapse changes,
+  run `python tools/run_dev_acceptance.py all-non-input`.
+- Automated PASS is not Controlled Live Acceptance PASS. Stop and report if a
+  task needs a protected-boundary change.
