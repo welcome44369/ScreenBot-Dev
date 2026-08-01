@@ -6,6 +6,10 @@ import pytesseract
 from app.target_capture import TargetCaptureService
 from app.ocr_pipeline import OCRPipeline
 from app.observation_engine import ObservationEngine
+from app.roi_visual_confidence import (
+    prepare_visual_frame,
+    resolve_stable_roi,
+)
 
 
 class TextDetector:
@@ -39,18 +43,28 @@ class TextDetector:
             allow_desktop_fallback=False,
         )
         image = capture.image
-        left = int(round(region["x_ratio"] * image.width))
-        top = int(round(region["y_ratio"] * image.height))
-        right = int(round((region["x_ratio"] + region["width_ratio"]) * image.width))
-        bottom = int(round((region["y_ratio"] + region["height_ratio"]) * image.height))
-        if right <= left or bottom <= top:
-            raise ValueError("Invalid OCR region dimensions")
+        stable_roi = resolve_stable_roi(region, image.size)
+        if not stable_roi.valid:
+            raise ValueError(
+                f"Invalid OCR region: {stable_roi.invalid_reason}"
+            )
+        left, top, right, bottom = stable_roi.pixel_rect
+        roi_image = image.crop((left, top, right, bottom))
         metadata = dict(capture.metadata)
         metadata.setdefault("captured_monotonic", time.monotonic())
         metadata["root_hwnd"] = int(
             getattr(target, "root_hwnd", target.hwnd)
         )
-        return image.crop((left, top, right, bottom)), metadata
+        metadata.update(
+            roi_revision=stable_roi.revision,
+            roi_valid=True,
+            roi_invalid_reason=None,
+            normalized_roi=stable_roi.normalized,
+            roi_pixel_rect=stable_roi.pixel_rect,
+            client_size=stable_roi.client_size,
+            visual_frame=prepare_visual_frame(roi_image),
+        )
+        return roi_image, metadata
 
     def detect_text(self, region):
         image = self.capture_region(region)

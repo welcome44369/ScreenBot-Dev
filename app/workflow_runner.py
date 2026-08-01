@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
+from uuid import uuid4
 
 from app.text_trigger import TextTrigger
 from app.trigger_runner import TriggerRunner
@@ -91,6 +92,7 @@ class WorkflowRunner:
         self._stop_trigger_matched = False
         self._stop_macro_cancel_requested = False
         self._condition_memory = {}
+        self._runtime_run_id = None
 
     def load_workflow(self, workflow_data):
         self.stop(manual=False)
@@ -132,6 +134,7 @@ class WorkflowRunner:
         self._stop_trigger_matched = False
         self._stop_macro_cancel_requested = False
         self._condition_memory.clear()
+        self._runtime_run_id = f"workflow-run-{uuid4().hex}"
         return self.workflow
 
     def load_workflow_file(self, file_path):
@@ -398,6 +401,8 @@ class WorkflowRunner:
                 input_safety_gate=self.input_safety_gate,
                 on_input_blocked=lambda reason, token=generation: self._on_input_blocked(reason, token),
                 workflow_process_diagnostics=self.workflow_process_diagnostics,
+                run_cycle=self.current_cycle,
+                run_id=self._runtime_run_id,
             )
             if self.workflow_process_diagnostics is not None:
                 self.workflow_process_diagnostics.stage(
@@ -518,13 +523,37 @@ class WorkflowRunner:
                 root_hwnd=getattr(
                     target_snapshot, "root_hwnd", observation.root_hwnd
                 ),
+                roi_valid=(
+                    observation.roi_valid
+                    and (
+                        target_snapshot is None
+                        or tuple(observation.client_size or ())
+                        == tuple(target_snapshot.current_client_size)
+                    )
+                ),
+                roi_invalid_reason=(
+                    observation.roi_invalid_reason
+                    if (
+                        target_snapshot is None
+                        or tuple(observation.client_size or ())
+                        == tuple(target_snapshot.current_client_size)
+                    )
+                    else "capture_session_client_size_mismatch"
+                ),
+                run_id=self._runtime_run_id,
+                cycle=self.current_cycle,
                 burst_id=self._stop_text_trigger.disappear_burst_id,
                 trigger_id=self.stop_trigger_id,
             )
             self._stop_last_ocr_text = observation.recognized_text
             self._stop_poll_count += 1
             result = self._stop_text_trigger.update(observation)
-            self.logger.info(
+            observation_log = (
+                self.logger.debug
+                if self._stop_text_trigger.is_disappear_burst_active()
+                else self.logger.info
+            )
+            observation_log(
                 "[Observation] source=global_stop state=%s exact=%s similarity=%.2f readability=%.2f presence=%.2f reason=%s",
                 observation.state, observation.exact_match, observation.text_similarity,
                 observation.readability_score, observation.presence_score, observation.reason,

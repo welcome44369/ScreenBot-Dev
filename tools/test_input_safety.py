@@ -62,7 +62,15 @@ class StopObserveDetector(WorkflowDetector):
     def __init__(self): self.calls=0
     def observe_text(self, *_args, **_kwargs):
         self.calls += 1
-        return ObservationResult("PRESENT", True, 1.0, .9, None, .9, True, "test", "stop", "stop")
+        if self.calls == 1:
+            return ObservationResult(
+                "ABSENT", False, 0.0, .9, None, .1, True,
+                "low_presence", "other", "stop",
+            )
+        return ObservationResult(
+            "PRESENT", True, 1.0, .9, None, .9, True,
+            "test", "stop", "stop",
+        )
 
 class InputSafetyTests(unittest.TestCase):
     def test_background_is_rejected(self):
@@ -218,9 +226,15 @@ class InputSafetyTests(unittest.TestCase):
         runner.state = WorkflowState.WAIT_TRIGGER
         runner.stop_trigger_enabled = True
         runner.stop_trigger_config = config
-        runner._stop_text_trigger = TextTrigger("stop", event="appear", confirm_frames=1)
+        runner._stop_text_trigger = TextTrigger(
+            "stop",
+            event="appear",
+            confirm_frames=1,
+            min_absent_duration_ms=0,
+        )
+        self.assertFalse(runner._check_stop_trigger(force=True))
         self.assertTrue(runner._check_stop_trigger(force=True))
-        self.assertEqual(detector.calls, 1)
+        self.assertEqual(detector.calls, 2)
         self.assertEqual(runner.stop_source, "stop_trigger")
 
 if __name__=='__main__': unittest.main(verbosity=2)

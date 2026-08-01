@@ -1,9 +1,16 @@
 import time
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
 from app.observation_engine import ObservationEngine, ObservationResult
+from app.roi_visual_confidence import (
+    VISUAL_ABSENT_THRESHOLD,
+    VISUAL_PRESENT_LIKELY_THRESHOLD,
+    VISUAL_PRESENT_STRONG_THRESHOLD,
+    classify_visual,
+    compare_visual_frame,
+)
 from app.trigger_conditions import LEGACY_APPEAR, LEGACY_DISAPPEAR, label_for_code, normalize_condition
 
 
@@ -58,8 +65,12 @@ class TextTrigger:
         self._disappear_evidence = []
         self._disappear_valid_samples = 0
         self._disappear_unknown_count = 0
+        self._disappear_burst_context = None
         self._last_accepted_capture_id = None
         self._last_accepted_captured_monotonic = None
+        self._confirmed_present_template = None
+        self._present_template_candidates = []
+        self._replacement_candidates = []
 
     def update(self, observation, now=None):
         if isinstance(observation, str):
@@ -67,7 +78,6 @@ class TextTrigger:
         if not isinstance(observation, ObservationResult):
             raise TypeError("TextTrigger.update requires ObservationResult")
         now = time.monotonic() if now is None else now
-        self._last_observation = observation
         self._condition_events = []
         previous = self.state
         if self.legacy_mode == LEGACY_APPEAR:
@@ -82,12 +92,17 @@ class TextTrigger:
             self.condition["mode"] == "edge"
             and self.condition["desired_state"] == "absent"
         ):
+            observation = self._fuse_edge_absent_observation(observation, now)
+            self._last_observation = observation
             return self._update_edge_absent(observation, now, previous)
+        self._last_observation = observation
         return self._update_condition(observation, now, previous)
 
     @staticmethod
     def classify_observation(observation):
-        """Map raw OCR output to conservative transition evidence."""
+        """Return the already fused class, or conservative OCR-only presence."""
+        if observation.fused_classification:
+            return observation.fused_classification
         if (
             not observation.observation_valid
             or observation.state == "INVALID"
@@ -109,9 +124,276 @@ class TextTrigger:
             return "PRESENT_LIKELY"
         if not (observation.recognized_text or "").strip():
             return "UNKNOWN"
-        if observation.state == "ABSENT" and similarity < 0.25:
-            return "ABSENT_STRONG"
+        # Absence authorization is never OCR-only.
         return "UNKNOWN"
+
+    def _fuse_edge_absent_observation(self, observation, now):
+        self._invalidate_template_if_identity_changed(observation)
+        template = self._confirmed_present_template
+        template_score = None
+        if (
+            template is not None
+            and observation.roi_valid
+            and observation.visual_frame is not None
+        ):
+            template_score = compare_visual_frame(
+                template["frame"], observation.visual_frame
+            )
+        visual_classification = classify_visual(template_score)
+        similarity = float(observation.text_similarity or 0.0)
+        ocr_strong = bool(
+            observation.exact_match or similarity >= 0.85
+        )
+        ocr_likely = similarity >= 0.50
+        evidence_sources = []
+
+        if not observation.roi_valid:
+            fused = "UNKNOWN"
+            evidence_sources.append(
+                observation.roi_invalid_reason or "roi_invalid"
+            )
+        elif (
+            not observation.observation_valid
+            or observation.state == "INVALID"
+            or observation.readability_score <= 0.0
+        ):
+            fused = "UNKNOWN"
+            evidence_sources.append("observation_invalid")
+        elif ocr_strong:
+            fused = "PRESENT_STRONG"
+            evidence_sources.append("ocr_present_strong")
+        elif ocr_likely:
+            fused = "PRESENT_LIKELY"
+            evidence_sources.append("ocr_present_likely")
+        elif (
+            visual_classification == "VISUAL_PRESENT_STRONG"
+        ):
+            fused = "PRESENT_STRONG"
+            evidence_sources.append("visual_present_strong")
+        elif (
+            visual_classification == "VISUAL_PRESENT_LIKELY"
+        ):
+            fused = "PRESENT_LIKELY"
+            evidence_sources.append("visual_present_likely")
+        elif (
+            template is not None
+            and visual_classification == "VISUAL_ABSENT_EVIDENCE"
+            and similarity < 0.50
+        ):
+            fused = "ABSENT_STRONG"
+            evidence_sources.append("visual_absent_evidence")
+        else:
+            fused = "UNKNOWN"
+            evidence_sources.append(
+                "template_unavailable"
+                if template is None
+                else "visual_ambiguous"
+            )
+
+        if fused in {"PRESENT_STRONG", "PRESENT_LIKELY"}:
+            self._replacement_candidates.clear()
+        elif fused == "ABSENT_STRONG":
+            replacement = self._normalized_replacement_text(observation)
+            if replacement:
+                self._replacement_candidates.append(
+                    (
+                        observation.capture_id,
+                        observation.captured_monotonic,
+                        replacement,
+                    )
+                )
+                self._replacement_candidates = (
+                    self._replacement_candidates[-3:]
+                )
+                if (
+                    sum(
+                        item[2] == replacement
+                        for item in self._replacement_candidates
+                    )
+                    >= 2
+                ):
+                    evidence_sources.append("replacement_text_2_of_3")
+
+        return replace(
+            observation,
+            template_available=self._confirmed_present_template is not None,
+            template_score=template_score,
+            visual_classification=visual_classification,
+            fused_classification=fused,
+            evidence_sources=tuple(evidence_sources),
+        )
+
+    @staticmethod
+    def _normalized_replacement_text(observation):
+        value = "".join(
+            (observation.recognized_text or "").split()
+        ).casefold()
+        if not value or observation.text_similarity >= 0.50:
+            return None
+        return value
+
+    def _record_present_template_candidate(self, observation, now):
+        required = (
+            observation.visual_frame,
+            observation.capture_id,
+            observation.captured_monotonic,
+            observation.session_id,
+            observation.generation,
+            observation.root_hwnd,
+            observation.run_id,
+            observation.cycle,
+            observation.trigger_id,
+            observation.roi_revision,
+            observation.client_size,
+        )
+        if any(value is None for value in required):
+            return
+        identity = self._visual_identity(observation)
+        if (
+            self._present_template_candidates
+            and self._present_template_candidates[-1]["identity"]
+            != identity
+        ):
+            self._present_template_candidates.clear()
+        if any(
+            item["capture_id"] == observation.capture_id
+            for item in self._present_template_candidates
+        ):
+            return
+        self._present_template_candidates.append(
+            {
+                "identity": identity,
+                "capture_id": observation.capture_id,
+                "captured_monotonic": observation.captured_monotonic,
+                "frame": observation.visual_frame.copy(),
+                "client_size": tuple(observation.client_size),
+            }
+        )
+        self._present_template_candidates = (
+            self._present_template_candidates[-3:]
+        )
+        matching = [
+            item
+            for item in self._present_template_candidates
+            if item["identity"] == identity
+        ]
+        # An exact/strong OCR observation is already an independent positive
+        # signal. Keep one fixed template for the armed session; never drift it
+        # by updating on later frames.
+        if len(matching) < 1:
+            return
+        latest = matching[-1]
+        self._confirmed_present_template = {
+            "frame": latest["frame"],
+            "session_id": observation.session_id,
+            "generation": observation.generation,
+            "root_hwnd": observation.root_hwnd,
+            "run_id": observation.run_id,
+            "cycle": observation.cycle,
+            "trigger_id": observation.trigger_id,
+            "roi_revision": observation.roi_revision,
+            "client_size": tuple(observation.client_size),
+            "capture_id": latest["capture_id"],
+            "captured_monotonic": latest["captured_monotonic"],
+            "template_width": int(latest["frame"].shape[1]),
+            "template_height": int(latest["frame"].shape[0]),
+        }
+        self._present_template_candidates.clear()
+        self._event(
+            "PRESENT_TEMPLATE_CREATED",
+            **self._template_log_metadata(),
+        )
+
+    def _invalidate_template_if_identity_changed(self, observation):
+        template = self._confirmed_present_template
+        if template is None:
+            return
+        identity_values = (
+            observation.session_id,
+            observation.generation,
+            observation.root_hwnd,
+            observation.run_id,
+            observation.cycle,
+            observation.trigger_id,
+            observation.roi_revision,
+        )
+        if any(value is None for value in identity_values):
+            return
+        reason = None
+        if observation.session_id != template["session_id"]:
+            reason = "session_changed"
+        elif observation.generation != template["generation"]:
+            reason = "generation_changed"
+        elif observation.root_hwnd != template["root_hwnd"]:
+            reason = "root_hwnd_changed"
+        elif observation.run_id != template["run_id"]:
+            reason = "run_changed"
+        elif observation.cycle != template["cycle"]:
+            reason = "cycle_changed"
+        elif observation.trigger_id != template["trigger_id"]:
+            reason = "trigger_changed"
+        elif observation.roi_revision != template["roi_revision"]:
+            reason = "roi_revision_changed"
+        elif self._client_aspect_changed(
+            template["client_size"], observation.client_size
+        ):
+            reason = "client_aspect_changed"
+        if reason:
+            self._invalidate_present_template(reason)
+
+    @staticmethod
+    def _client_aspect_changed(expected, actual):
+        if not expected or not actual or min(*expected, *actual) <= 0:
+            return True
+        expected_ratio = expected[0] / expected[1]
+        actual_ratio = actual[0] / actual[1]
+        return abs(actual_ratio / expected_ratio - 1.0) > 0.05
+
+    @staticmethod
+    def _visual_identity(observation):
+        return (
+            observation.session_id,
+            observation.generation,
+            observation.root_hwnd,
+            observation.run_id,
+            observation.cycle,
+            observation.trigger_id,
+            observation.roi_revision,
+        )
+
+    def _invalidate_present_template(self, reason):
+        if self._confirmed_present_template is None:
+            self._present_template_candidates.clear()
+            return
+        metadata = self._template_log_metadata()
+        self._confirmed_present_template = None
+        self._present_template_candidates.clear()
+        self._replacement_candidates.clear()
+        self._event(
+            "PRESENT_TEMPLATE_INVALIDATED",
+            reason=reason,
+            **metadata,
+        )
+
+    def _template_log_metadata(self):
+        template = self._confirmed_present_template or {}
+        return {
+            key: template.get(key)
+            for key in (
+                "session_id",
+                "generation",
+                "root_hwnd",
+                "run_id",
+                "cycle",
+                "trigger_id",
+                "roi_revision",
+                "client_size",
+                "capture_id",
+                "captured_monotonic",
+                "template_width",
+                "template_height",
+            )
+        }
 
     def is_disappear_burst_active(self):
         return self._disappear_burst_id is not None
@@ -136,11 +418,19 @@ class TextTrigger:
         )
         if freshness_reason:
             if (
-                freshness_reason == "target_identity_changed"
+                freshness_reason
+                in {
+                    "target_identity_changed",
+                    "target_identity_unavailable",
+                }
                 and self.is_disappear_burst_active()
             ):
                 self._cancel_disappear_burst(
-                    "target_identity_changed", now
+                    freshness_reason, now
+                )
+            if freshness_reason == "target_identity_changed":
+                self._invalidate_present_template(
+                    "target_identity_changed"
                 )
             self._event(
                 "DISAPPEAR_EVIDENCE_IGNORED",
@@ -150,6 +440,21 @@ class TextTrigger:
                 similarity=observation.text_similarity,
                 observation_valid=observation.observation_valid,
                 reason=freshness_reason,
+                roi_revision=observation.roi_revision,
+                roi_valid=observation.roi_valid,
+                template_available=observation.template_available,
+                template_score=observation.template_score,
+                visual_classification=observation.visual_classification,
+                ocr_similarity=observation.text_similarity,
+                fused_classification=classification,
+                evidence_sources=observation.evidence_sources,
+                capture_id=observation.capture_id,
+                run_id=observation.run_id,
+                cycle=observation.cycle,
+                trigger_id=observation.trigger_id,
+                session_id=observation.session_id,
+                generation=observation.generation,
+                root_hwnd=observation.root_hwnd,
             )
             return self._result(False, None, previous != self.state)
 
@@ -158,6 +463,33 @@ class TextTrigger:
             self._cancel_disappear_burst("window_expired", now)
 
         if classification == "PRESENT_STRONG":
+            if (
+                self._confirmed_present_template is None
+                and (
+                    observation.exact_match
+                    or observation.text_similarity >= 0.85
+                )
+                and not self.is_disappear_burst_active()
+            ):
+                self._record_present_template_candidate(observation, now)
+                if self._confirmed_present_template is not None:
+                    template_score = compare_visual_frame(
+                        self._confirmed_present_template["frame"],
+                        observation.visual_frame,
+                    )
+                    observation = replace(
+                        observation,
+                        template_available=True,
+                        template_score=template_score,
+                        visual_classification=classify_visual(
+                            template_score
+                        ),
+                        evidence_sources=(
+                            *observation.evidence_sources,
+                            "present_template_created",
+                        ),
+                    )
+                    self._last_observation = observation
             was_latched = bool(self.memory.get("latched"))
             if self.is_disappear_burst_active():
                 self._cancel_disappear_burst("present_strong", now)
@@ -170,6 +502,11 @@ class TextTrigger:
                 else self._present_count + 1
             )
             self._reset_absence()
+            if self._confirmed_present_template is None:
+                self.state = "PRESENT_CONFIRMING"
+                return self._result(
+                    False, None, previous != self.state
+                )
             if self._present_count >= self.confirm_frames:
                 first_present_baseline = (
                     self.memory.get("baseline_state") != "PRESENT"
@@ -182,6 +519,10 @@ class TextTrigger:
                     session_id=observation.session_id,
                     generation=observation.generation,
                     root_hwnd=observation.root_hwnd,
+                    roi_revision=observation.roi_revision,
+                    run_id=observation.run_id,
+                    cycle=observation.cycle,
+                    trigger_id=observation.trigger_id,
                 )
                 self.state = "ARMED_PRESENT"
                 if was_latched:
@@ -222,6 +563,20 @@ class TextTrigger:
                     similarity=observation.text_similarity,
                     observation_valid=observation.observation_valid,
                     reason=observation.reason or "unknown",
+                    roi_revision=observation.roi_revision,
+                    roi_valid=observation.roi_valid,
+                    template_available=observation.template_available,
+                    template_score=observation.template_score,
+                    visual_classification=observation.visual_classification,
+                    fused_classification=classification,
+                    evidence_sources=observation.evidence_sources,
+                    capture_id=observation.capture_id,
+                    run_id=observation.run_id,
+                    cycle=observation.cycle,
+                    trigger_id=observation.trigger_id,
+                    session_id=observation.session_id,
+                    generation=observation.generation,
+                    root_hwnd=observation.root_hwnd,
                 )
                 if self._disappear_unknown_count >= 2:
                     self._cancel_disappear_burst(
@@ -270,10 +625,30 @@ class TextTrigger:
             evidence_count=len(self._disappear_evidence),
             valid_sample_count=self._disappear_valid_samples,
             elapsed_ms=min(elapsed_ms, 1800),
+            roi_revision=observation.roi_revision,
+            roi_valid=observation.roi_valid,
+            template_available=observation.template_available,
+            template_score=observation.template_score,
+            visual_classification=observation.visual_classification,
+            ocr_similarity=observation.text_similarity,
+            fused_classification=classification,
+            evidence_sources=observation.evidence_sources,
+            capture_id=observation.capture_id,
+            run_id=observation.run_id,
+            cycle=observation.cycle,
+            trigger_id=observation.trigger_id,
+            session_id=observation.session_id,
+            generation=observation.generation,
+            root_hwnd=observation.root_hwnd,
         )
+        replacement_fast_path = (
+            "replacement_text_2_of_3" in observation.evidence_sources
+        )
+        required_evidence = 2 if replacement_fast_path else 4
+        required_span_ms = 350 if replacement_fast_path else 700
         if (
-            len(self._disappear_evidence) >= 4
-            and span_ms >= 700
+            len(self._disappear_evidence) >= required_evidence
+            and span_ms >= required_span_ms
             and elapsed_ms <= 1800
         ):
             burst_id = self._disappear_burst_id
@@ -292,11 +667,19 @@ class TextTrigger:
                 evidence_count=evidence_count,
                 evidence_span_ms=span_ms,
                 elapsed_ms=elapsed_ms,
+                confirmation_reason=(
+                    "stable_replacement_text"
+                    if replacement_fast_path
+                    else "visual_absence_quorum"
+                ),
             )
             self._event(
                 "TRIGGER_LATCHED",
                 latched_state="ABSENT",
                 rearm_requires="PRESENT",
+            )
+            self._invalidate_present_template(
+                "disappear_confirmed"
             )
             return self._match(
                 now, previous, "bounded_disappear_confirmation", latch=True
@@ -307,6 +690,10 @@ class TextTrigger:
         self, observation, classification, now
     ):
         if classification == "ABSENT_STRONG":
+            if not observation.roi_valid:
+                return "invalid_roi"
+            if not observation.template_available:
+                return "template_unavailable"
             required = (
                 observation.observation_id,
                 observation.capture_id,
@@ -314,6 +701,12 @@ class TextTrigger:
                 observation.session_id,
                 observation.generation,
                 observation.root_hwnd,
+                observation.roi_revision,
+                observation.client_size,
+                observation.template_score,
+                observation.run_id,
+                observation.cycle,
+                observation.trigger_id,
             )
             if any(value is None for value in required):
                 return "missing_freshness_metadata"
@@ -340,16 +733,34 @@ class TextTrigger:
             and observation.burst_id != self._disappear_burst_id
         ):
             return "stale_burst"
+        if (
+            self.is_disappear_burst_active()
+            and self._disappear_burst_context
+            and (
+                observation.run_id,
+                observation.cycle,
+                observation.trigger_id,
+            )
+            != self._disappear_burst_context
+        ):
+            return "stale_run_context"
         expected = (
             self.memory.get("session_id"),
             self.memory.get("generation"),
             self.memory.get("root_hwnd"),
+            self.memory.get("roi_revision"),
         )
         actual = (
             observation.session_id,
             observation.generation,
             observation.root_hwnd,
+            observation.roi_revision,
         )
+        if any(
+            expected_value is not None and actual_value is None
+            for expected_value, actual_value in zip(expected, actual)
+        ):
+            return "target_identity_unavailable"
         for expected_value, actual_value in zip(expected, actual):
             if (
                 expected_value is not None
@@ -372,10 +783,19 @@ class TextTrigger:
         self._disappear_evidence = []
         self._disappear_valid_samples = 0
         self._disappear_unknown_count = 0
+        self._disappear_burst_context = (
+            observation.run_id,
+            observation.cycle,
+            observation.trigger_id,
+        )
         self.memory.update(
             session_id=observation.session_id,
             generation=observation.generation,
             root_hwnd=observation.root_hwnd,
+            roi_revision=observation.roi_revision,
+            run_id=observation.run_id,
+            cycle=observation.cycle,
+            trigger_id=observation.trigger_id,
         )
         self._event(
             "DISAPPEAR_BURST_STARTED",
@@ -383,6 +803,20 @@ class TextTrigger:
             observation_id=observation.observation_id,
             maximum_ms=1800,
             interval_ms=175,
+            roi_revision=observation.roi_revision,
+            roi_valid=observation.roi_valid,
+            template_available=observation.template_available,
+            template_score=observation.template_score,
+            visual_classification=observation.visual_classification,
+            fused_classification=observation.fused_classification,
+            evidence_sources=observation.evidence_sources,
+            capture_id=observation.capture_id,
+            run_id=observation.run_id,
+            cycle=observation.cycle,
+            trigger_id=observation.trigger_id,
+            session_id=observation.session_id,
+            generation=observation.generation,
+            root_hwnd=observation.root_hwnd,
         )
 
     def _disappear_burst_expired(self, now):
@@ -413,6 +847,7 @@ class TextTrigger:
         self._disappear_evidence = []
         self._disappear_valid_samples = 0
         self._disappear_unknown_count = 0
+        self._disappear_burst_context = None
 
     # Exact legacy paths intentionally remain separate: existing user JSON
     # must not acquire new edge semantics just because the new enum exists.
@@ -748,4 +1183,29 @@ class TextTrigger:
             "disappear_valid_sample_count": self._disappear_valid_samples,
             "disappear_burst_elapsed_ms": burst_elapsed_ms,
             "disappear_burst_maximum_ms": 1800,
+            "present_template_available": (
+                self._confirmed_present_template is not None
+            ),
+            "present_template_metadata": (
+                self._template_log_metadata()
+                if self._confirmed_present_template is not None
+                else None
+            ),
+            "roi_revision": (
+                observation.roi_revision if observation else None
+            ),
+            "roi_valid": (
+                observation.roi_valid if observation else False
+            ),
+            "template_score": (
+                observation.template_score if observation else None
+            ),
+            "visual_classification": (
+                observation.visual_classification
+                if observation
+                else "VISUAL_UNAVAILABLE"
+            ),
+            "fused_classification": (
+                observation.fused_classification if observation else None
+            ),
         }

@@ -257,6 +257,15 @@ class WorkflowStartTriggerTests(unittest.TestCase):
             },
             "macro": "fake.json",
         })
+        absent = ObservationResult(
+            state="ABSENT", exact_match=False, text_similarity=0.0,
+            readability_score=1.0, visual_similarity=None,
+            presence_score=0.0, observation_valid=True,
+            reason="low_presence", recognized_text="other",
+            target_text="ready",
+        )
+        runner.text_trigger.update(absent, now=0.0)
+        runner.text_trigger.update(absent, now=0.321)
         runner._run()
         status = runner.get_status_snapshot()
         self.assertEqual(runner.text_trigger.min_absent_duration_ms, 321)

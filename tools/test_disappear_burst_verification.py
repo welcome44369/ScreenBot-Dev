@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import unittest
 from unittest.mock import Mock
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -18,6 +19,18 @@ from app.trigger_runner import TriggerRunner
 TARGET = "尋找採集物"
 
 
+def _visual_frame(kind):
+    frame = np.zeros((64, 128), dtype=np.uint8)
+    if kind in {"present", "empty"}:
+        frame[:, ::8] = 255
+    elif kind == "likely":
+        frame[:, ::8] = 220
+        frame[:, 4::16] = 50
+    else:
+        frame[::8, :] = 255
+    return frame
+
+
 def observation(
     kind,
     captured,
@@ -27,6 +40,10 @@ def observation(
     burst_id=None,
     generation=1,
     capture_id=None,
+    recognized_text=None,
+    run_id="run-a",
+    cycle=1,
+    trigger_id="trigger-a",
 ):
     if kind == "present":
         state, exact, score, text, valid, reason = (
@@ -51,7 +68,7 @@ def observation(
             "ABSENT",
             False,
             0.05 if similarity is None else similarity,
-            "其他介面文字",
+            recognized_text or f"其他介面文字{index}",
             True,
             "low_presence",
         )
@@ -91,7 +108,15 @@ def observation(
         generation=generation,
         root_hwnd=100,
         burst_id=burst_id,
-        trigger_id="trigger-a",
+        run_id=run_id,
+        cycle=cycle,
+        trigger_id=trigger_id,
+        roi_revision="roi-a",
+        roi_valid=True,
+        normalized_roi=(0.1, 0.2, 0.3, 0.4),
+        roi_pixel_rect=(80, 120, 320, 360),
+        client_size=(800, 600),
+        visual_frame=_visual_frame(kind),
     )
 
 
@@ -255,9 +280,7 @@ class DisappearBurstVerificationTests(unittest.TestCase):
             for index, moment in enumerate((0.0, 0.3, 0.6, 0.9), 1)
         ]
         self.assertFalse(any(result.triggered for result in results))
-        self.assertEqual(
-            trigger.get_status_snapshot()["baseline_state"], "ABSENT"
-        )
+        self.assertFalse(trigger.get_status_snapshot()["armed"])
 
     def test_runner_uses_bounded_normal_and_burst_intervals(self):
         runner = TriggerRunner(

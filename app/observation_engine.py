@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from difflib import SequenceMatcher
 import re
 
@@ -54,10 +54,27 @@ class ObservationResult:
     root_hwnd: int | None = None
     burst_id: str | None = None
     run_id: str | None = None
+    cycle: int | None = None
     trigger_id: str | None = None
+    roi_revision: str | None = None
+    roi_valid: bool = False
+    roi_invalid_reason: str | None = None
+    normalized_roi: tuple[float, float, float, float] | None = None
+    roi_pixel_rect: tuple[int, int, int, int] | None = None
+    client_size: tuple[int, int] | None = None
+    visual_frame: object | None = None
+    template_available: bool = False
+    template_score: float | None = None
+    visual_classification: str = "VISUAL_UNAVAILABLE"
+    fused_classification: str | None = None
+    evidence_sources: tuple[str, ...] = ()
 
     def as_dict(self):
-        result = asdict(self)
+        result = {
+            item.name: getattr(self, item.name)
+            for item in fields(self)
+            if item.name != "visual_frame"
+        }
         if self.readability is not None:
             result["readability"] = self.readability.as_dict()
         return result
@@ -159,7 +176,20 @@ class ObservationEngine:
                 "root_hwnd",
                 "burst_id",
                 "run_id",
+                "cycle",
                 "trigger_id",
+                "roi_revision",
+                "roi_valid",
+                "roi_invalid_reason",
+                "normalized_roi",
+                "roi_pixel_rect",
+                "client_size",
+                "visual_frame",
+                "template_available",
+                "template_score",
+                "visual_classification",
+                "fused_classification",
+                "evidence_sources",
             )
         }
         targets = [target_text] if isinstance(target_text, str) else list(target_text or [])

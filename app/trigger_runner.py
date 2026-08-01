@@ -3,6 +3,7 @@ import threading
 import time
 from dataclasses import replace
 from datetime import datetime
+from uuid import uuid4
 
 from app.text_trigger import TextTrigger
 from app.trigger_conditions import normalize_condition
@@ -24,6 +25,8 @@ class TriggerRunner:
         input_safety_gate=None,
         on_input_blocked=None,
         workflow_process_diagnostics=None,
+        run_cycle=None,
+        run_id=None,
     ):
         self.text_detector = text_detector
         self.script_store = script_store
@@ -59,6 +62,16 @@ class TriggerRunner:
         self._input_safety_gate = input_safety_gate
         self._on_input_blocked = on_input_blocked
         self._workflow_process_diagnostics = workflow_process_diagnostics
+        self._run_id = (
+            run_id
+            or getattr(workflow_process_diagnostics, "_run_id", None)
+            or f"trigger-run-{uuid4().hex}"
+        )
+        self._trigger_id = (
+            trigger_config.get("id")
+            or self.trigger_data.get("name")
+        )
+        self._run_cycle = run_cycle
         self._input_suspended = False
         self._input_blocked_reason = None
         self._last_authorization = None
@@ -109,14 +122,16 @@ class TriggerRunner:
         """Request polling cancellation without joining the caller's thread."""
         self._stop_event.set()
         if self.text_trigger is not None:
-            for condition_event in self.text_trigger.cancel_disappear_burst(
-                "runtime_stopped"
-            ):
-                self.logger.info(
-                    "%s %s",
-                    condition_event["event"],
-                    condition_event["data"],
-                )
+            cancel_burst = getattr(
+                self.text_trigger, "cancel_disappear_burst", None
+            )
+            if callable(cancel_burst):
+                for condition_event in cancel_burst("runtime_stopped"):
+                    self.logger.info(
+                        "%s %s",
+                        condition_event["event"],
+                        condition_event["data"],
+                    )
 
     def is_active(self):
         return self._thread is not None and self._thread.is_alive()
@@ -166,6 +181,7 @@ class TriggerRunner:
                     self._macro_started_at = None
                     self._macro_running = False
 
+                capture_authorization = self._last_authorization
                 observation = self.text_detector.observe_text(
                     self.trigger_data["trigger"]["region"],
                     self.text_trigger.target_texts,
@@ -186,38 +202,90 @@ class TriggerRunner:
                         self._stop_event.set()
                         self._publish_status()
                         break
+                    capture_snapshot = getattr(
+                        capture_authorization, "snapshot", None
+                    )
+                    post_snapshot = getattr(
+                        post_authorization, "snapshot", None
+                    )
+                    if (
+                        capture_snapshot is not None
+                        and post_snapshot is not None
+                        and (
+                            capture_snapshot.session_id,
+                            capture_snapshot.generation,
+                            capture_snapshot.root_hwnd,
+                        )
+                        != (
+                            post_snapshot.session_id,
+                            post_snapshot.generation,
+                            post_snapshot.root_hwnd,
+                        )
+                    ):
+                        self._last_authorization = post_authorization
+                        self._last_error = (
+                            "target_unavailable:"
+                            "CAPTURE_IDENTITY_CHANGED"
+                        )
+                        self._stop_event.set()
+                        self._publish_status()
+                        break
                     self._last_authorization = post_authorization
                 authorization_snapshot = getattr(
                     self._last_authorization, "snapshot", None
                 )
                 if hasattr(observation, "session_id"):
+                    runtime_snapshot = (
+                        authorization_snapshot
+                        or self._expected_target_session
+                    )
+                    expected_client_size = getattr(
+                        runtime_snapshot, "current_client_size", None
+                    )
+                    roi_valid = bool(observation.roi_valid)
+                    roi_invalid_reason = observation.roi_invalid_reason
+                    if (
+                        expected_client_size is not None
+                        and tuple(observation.client_size or ())
+                        != tuple(expected_client_size)
+                    ):
+                        roi_valid = False
+                        roi_invalid_reason = (
+                            "capture_session_client_size_mismatch"
+                        )
                     observation = replace(
                         observation,
                         session_id=getattr(
-                            authorization_snapshot,
+                            runtime_snapshot,
                             "session_id",
                             observation.session_id,
                         ),
                         generation=getattr(
-                            authorization_snapshot,
+                            runtime_snapshot,
                             "generation",
                             observation.generation,
                         ),
                         root_hwnd=getattr(
-                            authorization_snapshot,
+                            runtime_snapshot,
                             "root_hwnd",
                             observation.root_hwnd,
                         ),
+                        roi_valid=roi_valid,
+                        roi_invalid_reason=roi_invalid_reason,
+                        run_id=self._run_id,
+                        cycle=self._run_cycle,
                         burst_id=self.text_trigger.disappear_burst_id,
-                        trigger_id=(
-                            self.trigger_data["trigger"].get("id")
-                            or self.trigger_data.get("name")
-                        ),
+                        trigger_id=self._trigger_id,
                     )
 
                 ocr_text = observation.recognized_text
                 result = self.text_trigger.update(observation)
-                self.logger.info(
+                observation_log = (
+                    self.logger.debug
+                    if self._is_disappear_burst_active()
+                    else self.logger.info
+                )
+                observation_log(
                     "[Observation] state=%s exact=%s similarity=%.2f readability=%.2f presence=%.2f reason=%s",
                     observation.state, observation.exact_match, observation.text_similarity,
                     observation.readability_score, observation.presence_score, observation.reason,
@@ -329,11 +397,16 @@ class TriggerRunner:
     def _wait_interval(self):
         interval = (
             self._burst_poll_interval_ms
-            if self.text_trigger is not None
-            and self.text_trigger.is_disappear_burst_active()
+            if self._is_disappear_burst_active()
             else self._poll_interval_ms
         )
         self._stop_event.wait(interval / 1000.0)
+
+    def _is_disappear_burst_active(self):
+        check = getattr(
+            self.text_trigger, "is_disappear_burst_active", None
+        )
+        return bool(callable(check) and check())
 
     def _new_text_trigger(self):
         trigger_config = self.trigger_data["trigger"]

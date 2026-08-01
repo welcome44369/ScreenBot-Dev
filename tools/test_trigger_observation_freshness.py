@@ -56,6 +56,25 @@ class TriggerObservationFreshnessTests(unittest.TestCase):
             [event["data"].get("reason") for event in result.condition_events],
         )
 
+    def test_old_run_cycle_context_is_rejected(self):
+        self.trigger.update(
+            observation("absent", 0.10, 1), now=0.10
+        )
+        result = self.trigger.update(
+            observation(
+                "absent",
+                0.35,
+                2,
+                burst_id=self.trigger.disappear_burst_id,
+                cycle=2,
+            ),
+            now=0.35,
+        )
+        self.assertIn(
+            "stale_run_context",
+            [event["data"].get("reason") for event in result.condition_events],
+        )
+
     def test_old_generation_is_rejected_before_starting_burst(self):
         result = self.trigger.update(
             observation("absent", 0.10, 1, generation=2),
@@ -145,7 +164,7 @@ class TriggerObservationFreshnessTests(unittest.TestCase):
             [event["event"] for event in result.condition_events],
         )
         self.assertIn(
-            "target_identity_changed",
+            "target_identity_unavailable",
             [event["data"].get("reason") for event in result.condition_events],
         )
 
