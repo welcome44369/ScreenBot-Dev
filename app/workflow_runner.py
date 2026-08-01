@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import Path
@@ -223,6 +224,17 @@ class WorkflowRunner:
             self.state = WorkflowState.STOPPING
 
         self._stop_event.set()
+        if self._stop_text_trigger is not None:
+            for condition_event in (
+                self._stop_text_trigger.cancel_disappear_burst(
+                    "runtime_stopped"
+                )
+            ):
+                self.logger.info(
+                    "%s %s",
+                    condition_event["event"],
+                    condition_event["data"],
+                )
         runner = self._active_trigger_runner
         if runner is not None:
             request_stop = getattr(runner, "request_stop", None)
@@ -456,7 +468,19 @@ class WorkflowRunner:
             return False
 
         now = time.monotonic()
-        poll_interval_ms = self.stop_trigger_config.get("poll_interval_ms", 500)
+        configured_interval = self.stop_trigger_config.get(
+            "poll_interval_ms", 500
+        )
+        poll_interval_ms = (
+            175
+            if self._stop_text_trigger.is_disappear_burst_active()
+            else (
+                max(350, min(500, int(configured_interval)))
+                if self._stop_text_trigger.condition
+                == {"mode": "edge", "desired_state": "absent"}
+                else configured_interval
+            )
+        )
         if not force and (now - self._stop_last_poll_monotonic) * 1000.0 < poll_interval_ms:
             return False
         self._stop_last_poll_monotonic = now
@@ -467,6 +491,36 @@ class WorkflowRunner:
                 self._stop_text_trigger.target_texts,
                 self.stop_trigger_config.get("observation"),
             )
+            target_snapshot = (
+                self.input_safety_gate.target_session.get_snapshot()
+                if self.input_safety_gate is not None
+                else None
+            )
+            if self._stop_event.is_set():
+                return False
+            if self._expected_target_session is not None and (
+                target_snapshot is None
+                or target_snapshot.session_id
+                != self._expected_target_session.session_id
+                or target_snapshot.generation
+                != self._expected_target_session.generation
+                or not target_snapshot.identity_valid
+            ):
+                return False
+            observation = replace(
+                observation,
+                session_id=getattr(
+                    target_snapshot, "session_id", observation.session_id
+                ),
+                generation=getattr(
+                    target_snapshot, "generation", observation.generation
+                ),
+                root_hwnd=getattr(
+                    target_snapshot, "root_hwnd", observation.root_hwnd
+                ),
+                burst_id=self._stop_text_trigger.disappear_burst_id,
+                trigger_id=self.stop_trigger_id,
+            )
             self._stop_last_ocr_text = observation.recognized_text
             self._stop_poll_count += 1
             result = self._stop_text_trigger.update(observation)
@@ -475,6 +529,12 @@ class WorkflowRunner:
                 observation.state, observation.exact_match, observation.text_similarity,
                 observation.readability_score, observation.presence_score, observation.reason,
             )
+            for condition_event in result.condition_events:
+                self.logger.info(
+                    "%s %s",
+                    condition_event["event"],
+                    condition_event["data"],
+                )
             if result.triggered:
                 return self._request_stop_from_trigger(result)
         except Exception as exc:

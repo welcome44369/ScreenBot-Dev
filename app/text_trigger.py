@@ -1,6 +1,7 @@
 import time
 from datetime import datetime
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 from app.observation_engine import ObservationEngine, ObservationResult
 from app.trigger_conditions import LEGACY_APPEAR, LEGACY_DISAPPEAR, label_for_code, normalize_condition
@@ -52,6 +53,13 @@ class TextTrigger:
         self._pending_started_at = None
         self._pending_last_valid_at = None
         self._condition_events = []
+        self._disappear_burst_id = None
+        self._disappear_burst_started_at = None
+        self._disappear_evidence = []
+        self._disappear_valid_samples = 0
+        self._disappear_unknown_count = 0
+        self._last_accepted_capture_id = None
+        self._last_accepted_captured_monotonic = None
 
     def update(self, observation, now=None):
         if isinstance(observation, str):
@@ -70,7 +78,341 @@ class TextTrigger:
             if observation.state == "INVALID":
                 return self._result(False, None, previous != self.state)
             return self._update_legacy_disappear(observation, now, previous)
+        if (
+            self.condition["mode"] == "edge"
+            and self.condition["desired_state"] == "absent"
+        ):
+            return self._update_edge_absent(observation, now, previous)
         return self._update_condition(observation, now, previous)
+
+    @staticmethod
+    def classify_observation(observation):
+        """Map raw OCR output to conservative transition evidence."""
+        if (
+            not observation.observation_valid
+            or observation.state == "INVALID"
+            or observation.reason
+            in {
+                "unreadable_region",
+                "near_black",
+                "near_white",
+                "near_uniform",
+                "invalid_crop",
+                "stale_observation",
+            }
+        ):
+            return "UNKNOWN"
+        similarity = float(observation.text_similarity or 0.0)
+        if observation.exact_match or similarity >= 0.85:
+            return "PRESENT_STRONG"
+        if similarity >= 0.50:
+            return "PRESENT_LIKELY"
+        if not (observation.recognized_text or "").strip():
+            return "UNKNOWN"
+        if observation.state == "ABSENT" and similarity < 0.25:
+            return "ABSENT_STRONG"
+        return "UNKNOWN"
+
+    def is_disappear_burst_active(self):
+        return self._disappear_burst_id is not None
+
+    @property
+    def disappear_burst_id(self):
+        return self._disappear_burst_id
+
+    def cancel_disappear_burst(self, reason="runtime_stopped", now=None):
+        """Cancel pending absence evidence without changing the edge latch."""
+        self._condition_events = []
+        if self.is_disappear_burst_active():
+            self._cancel_disappear_burst(
+                reason, time.monotonic() if now is None else now
+            )
+        return tuple(self._condition_events)
+
+    def _update_edge_absent(self, observation, now, previous):
+        classification = self.classify_observation(observation)
+        freshness_reason = self._observation_freshness_reason(
+            observation, classification, now
+        )
+        if freshness_reason:
+            if (
+                freshness_reason == "target_identity_changed"
+                and self.is_disappear_burst_active()
+            ):
+                self._cancel_disappear_burst(
+                    "target_identity_changed", now
+                )
+            self._event(
+                "DISAPPEAR_EVIDENCE_IGNORED",
+                burst_id=self._disappear_burst_id,
+                observation_id=observation.observation_id,
+                classification=classification,
+                similarity=observation.text_similarity,
+                observation_valid=observation.observation_valid,
+                reason=freshness_reason,
+            )
+            return self._result(False, None, previous != self.state)
+
+        self._remember_observation_order(observation)
+        if self._disappear_burst_expired(now):
+            self._cancel_disappear_burst("window_expired", now)
+
+        if classification == "PRESENT_STRONG":
+            was_latched = bool(self.memory.get("latched"))
+            if self.is_disappear_burst_active():
+                self._cancel_disappear_burst("present_strong", now)
+            already_armed = bool(
+                self.memory.get("armed") and not was_latched
+            )
+            self._present_count = (
+                self.confirm_frames
+                if already_armed
+                else self._present_count + 1
+            )
+            self._reset_absence()
+            if self._present_count >= self.confirm_frames:
+                first_present_baseline = (
+                    self.memory.get("baseline_state") != "PRESENT"
+                    or not self.memory.get("armed")
+                )
+                self.memory.update(
+                    baseline_state="PRESENT",
+                    armed=True,
+                    latched=False,
+                    session_id=observation.session_id,
+                    generation=observation.generation,
+                    root_hwnd=observation.root_hwnd,
+                )
+                self.state = "ARMED_PRESENT"
+                if was_latched:
+                    self._event(
+                        "TRIGGER_REARMED",
+                        confirmed_opposite_state="PRESENT",
+                        previous_latched_state="ABSENT",
+                    )
+                elif first_present_baseline:
+                    self._event(
+                        "DISAPPEAR_BASELINE_CONFIRMED",
+                        baseline_state="PRESENT",
+                    )
+            else:
+                self.state = "PRESENT_CONFIRMING"
+            return self._result(False, None, previous != self.state)
+
+        self._present_count = 0
+        if classification == "PRESENT_LIKELY":
+            if self.is_disappear_burst_active():
+                self._cancel_disappear_burst("present_likely", now)
+            self._reset_absence()
+            self.state = (
+                "ARMED_PRESENT"
+                if self.memory.get("armed")
+                else "PRESENT_LIKELY"
+            )
+            return self._result(False, None, previous != self.state)
+
+        if classification == "UNKNOWN":
+            if self.is_disappear_burst_active():
+                self._disappear_unknown_count += 1
+                self._event(
+                    "DISAPPEAR_EVIDENCE_IGNORED",
+                    burst_id=self._disappear_burst_id,
+                    observation_id=observation.observation_id,
+                    classification=classification,
+                    similarity=observation.text_similarity,
+                    observation_valid=observation.observation_valid,
+                    reason=observation.reason or "unknown",
+                )
+                if self._disappear_unknown_count >= 2:
+                    self._cancel_disappear_burst(
+                        "consecutive_unknown", now
+                    )
+            return self._result(False, None, previous != self.state)
+
+        # ABSENT_STRONG never arms an initially absent trigger.
+        if not self.memory.get("armed") or self.memory.get("latched"):
+            if self.memory.get("baseline_state") is None:
+                self.memory["baseline_state"] = "ABSENT"
+                self._event("TRIGGER_BASELINE_SET", baseline_state="ABSENT")
+            self.state = (
+                "LATCHED_ABSENT"
+                if self.memory.get("latched")
+                else "CONFIRMED_ABSENT"
+            )
+            return self._result(False, None, previous != self.state)
+
+        if not self.is_disappear_burst_active():
+            self._start_disappear_burst(observation, now)
+
+        self._disappear_unknown_count = 0
+        captured = float(observation.captured_monotonic)
+        self._disappear_evidence.append(
+            (captured, observation.capture_id, observation.observation_id)
+        )
+        self._disappear_evidence = self._disappear_evidence[-5:]
+        self._disappear_valid_samples += 1
+        elapsed_ms = int((now - self._disappear_burst_started_at) * 1000)
+        span_ms = int(
+            (
+                self._disappear_evidence[-1][0]
+                - self._disappear_evidence[0][0]
+            )
+            * 1000
+        )
+        self.state = "DISAPPEAR_VERIFY_BURST"
+        self._event(
+            "DISAPPEAR_EVIDENCE_ACCEPTED",
+            burst_id=self._disappear_burst_id,
+            observation_id=observation.observation_id,
+            classification=classification,
+            similarity=observation.text_similarity,
+            observation_valid=observation.observation_valid,
+            evidence_count=len(self._disappear_evidence),
+            valid_sample_count=self._disappear_valid_samples,
+            elapsed_ms=min(elapsed_ms, 1800),
+        )
+        if (
+            len(self._disappear_evidence) >= 4
+            and span_ms >= 700
+            and elapsed_ms <= 1800
+        ):
+            burst_id = self._disappear_burst_id
+            evidence_count = len(self._disappear_evidence)
+            self.memory.update(
+                baseline_state="ABSENT",
+                armed=False,
+                latched=True,
+                latched_state="ABSENT",
+            )
+            self._clear_disappear_burst()
+            self.state = "LATCHED_ABSENT"
+            self._event(
+                "DISAPPEAR_CONFIRMED",
+                burst_id=burst_id,
+                evidence_count=evidence_count,
+                evidence_span_ms=span_ms,
+                elapsed_ms=elapsed_ms,
+            )
+            self._event(
+                "TRIGGER_LATCHED",
+                latched_state="ABSENT",
+                rearm_requires="PRESENT",
+            )
+            return self._match(
+                now, previous, "bounded_disappear_confirmation", latch=True
+            )
+        return self._result(False, None, previous != self.state)
+
+    def _observation_freshness_reason(
+        self, observation, classification, now
+    ):
+        if classification == "ABSENT_STRONG":
+            required = (
+                observation.observation_id,
+                observation.capture_id,
+                observation.captured_monotonic,
+                observation.session_id,
+                observation.generation,
+                observation.root_hwnd,
+            )
+            if any(value is None for value in required):
+                return "missing_freshness_metadata"
+        if (
+            observation.capture_id is not None
+            and observation.capture_id == self._last_accepted_capture_id
+        ):
+            return "duplicate_capture"
+        if (
+            observation.captured_monotonic is not None
+            and self._last_accepted_captured_monotonic is not None
+            and observation.captured_monotonic
+            <= self._last_accepted_captured_monotonic
+        ):
+            return "out_of_order_capture"
+        if (
+            observation.captured_monotonic is not None
+            and now - observation.captured_monotonic > 1.8
+        ):
+            return "stale_observation"
+        if (
+            self.is_disappear_burst_active()
+            and observation.burst_id is not None
+            and observation.burst_id != self._disappear_burst_id
+        ):
+            return "stale_burst"
+        expected = (
+            self.memory.get("session_id"),
+            self.memory.get("generation"),
+            self.memory.get("root_hwnd"),
+        )
+        actual = (
+            observation.session_id,
+            observation.generation,
+            observation.root_hwnd,
+        )
+        for expected_value, actual_value in zip(expected, actual):
+            if (
+                expected_value is not None
+                and actual_value != expected_value
+            ):
+                return "target_identity_changed"
+        return None
+
+    def _remember_observation_order(self, observation):
+        if observation.capture_id is not None:
+            self._last_accepted_capture_id = observation.capture_id
+        if observation.captured_monotonic is not None:
+            self._last_accepted_captured_monotonic = (
+                observation.captured_monotonic
+            )
+
+    def _start_disappear_burst(self, observation, now):
+        self._disappear_burst_id = f"disappear-{uuid4().hex}"
+        self._disappear_burst_started_at = now
+        self._disappear_evidence = []
+        self._disappear_valid_samples = 0
+        self._disappear_unknown_count = 0
+        self.memory.update(
+            session_id=observation.session_id,
+            generation=observation.generation,
+            root_hwnd=observation.root_hwnd,
+        )
+        self._event(
+            "DISAPPEAR_BURST_STARTED",
+            burst_id=self._disappear_burst_id,
+            observation_id=observation.observation_id,
+            maximum_ms=1800,
+            interval_ms=175,
+        )
+
+    def _disappear_burst_expired(self, now):
+        return bool(
+            self._disappear_burst_started_at is not None
+            and now - self._disappear_burst_started_at > 1.8
+        )
+
+    def _cancel_disappear_burst(self, reason, now):
+        if not self.is_disappear_burst_active():
+            return
+        burst_id = self._disappear_burst_id
+        elapsed_ms = int((now - self._disappear_burst_started_at) * 1000)
+        evidence_count = len(self._disappear_evidence)
+        self._clear_disappear_burst()
+        self.state = "ARMED_PRESENT"
+        self._event(
+            "DISAPPEAR_BURST_CANCELLED",
+            burst_id=burst_id,
+            reason=reason,
+            evidence_count=evidence_count,
+            elapsed_ms=min(elapsed_ms, 1800),
+        )
+
+    def _clear_disappear_burst(self):
+        self._disappear_burst_id = None
+        self._disappear_burst_started_at = None
+        self._disappear_evidence = []
+        self._disappear_valid_samples = 0
+        self._disappear_unknown_count = 0
 
     # Exact legacy paths intentionally remain separate: existing user JSON
     # must not acquire new edge semantics just because the new enum exists.
@@ -145,18 +487,15 @@ class TextTrigger:
 
         attempt_active = bool(self.memory.get("transition_attempt_active"))
         if not attempt_active:
-            qualified_near_match = desired == "ABSENT" and observation.state == "UNCERTAIN" and observation.reason == "near_match"
-            if observation.state == opposite or qualified_near_match:
+            if observation.state == opposite:
                 self.memory["transition_attempt_active"] = True
                 self.memory["transition_candidate_state"] = opposite
                 self.memory["transition_tracking_mode"] = f"TRACK_{direction}"
                 self.memory["transition_attempt_index"] = int(self.memory.get("transition_attempt_index", 0)) + 1
                 self.memory["transition_interrupt_count"] = 0
                 self.memory["transition_result"] = "FAIL"
-                self._event("TRIGGER_TRANSITION_TRACK_STARTED", direction=direction, candidate_state=opposite, attempt_index=self.memory["transition_attempt_index"], reason="near_match" if qualified_near_match else "opposite_observation")
+                self._event("TRIGGER_TRANSITION_TRACK_STARTED", direction=direction, candidate_state=opposite, attempt_index=self.memory["transition_attempt_index"], reason="opposite_observation")
                 self._reset_pending()
-                if qualified_near_match:
-                    return self._result(False, None, previous != self.state)
             else:
                 # Permanently desired observations must be inert: no attempt,
                 # no lost episode, no recovery token.
@@ -175,10 +514,9 @@ class TextTrigger:
                 self._record_lost(now, previous, direction, "returned_to_desired_state")
             return self._result(False, None, previous != self.state)
 
-        # For state+absent, near_match remains positive partial PRESENT
-        # evidence.  All other UNCERTAIN and every INVALID are interruptions.
+        # A near-match is never allowed to manufacture a static-recovery
+        # opportunity. It remains inert until a confirmed opposite state.
         if observation.state == "UNCERTAIN" and desired == "ABSENT" and observation.reason == "near_match":
-            self.memory["transition_interrupt_count"] = 0
             return self._result(False, None, previous != self.state)
         interruptions = int(self.memory.get("transition_interrupt_count", 0)) + 1
         self.memory["transition_interrupt_count"] = interruptions
@@ -354,11 +692,27 @@ class TextTrigger:
         now = time.monotonic()
         observation = self._last_observation
         code = None if self.legacy_mode else next((f"{m}_{d}" for m, d in [(self.condition['mode'], self.condition['desired_state'])]), None)
+        burst_active = self.is_disappear_burst_active()
+        burst_elapsed_ms = (
+            min(
+                1800,
+                int((now - self._disappear_burst_started_at) * 1000),
+            )
+            if burst_active
+            else 0
+        )
         return {
-            "stable_present": self.memory.get("last_confirmed_state") == "PRESENT",
+            "stable_present": (
+                self.memory.get("last_confirmed_state") == "PRESENT"
+                or self.memory.get("baseline_state") == "PRESENT"
+            ),
             "candidate_present": observation.state == "PRESENT" if observation else None,
-            "candidate_count": self._pending_count or 0,
-            "confirm_frames": self.confirm_frames,
+            "candidate_count": (
+                min(5, len(self._disappear_evidence))
+                if burst_active
+                else self._pending_count or 0
+            ),
+            "confirm_frames": 5 if burst_active else self.confirm_frames,
             "last_present": observation.state == "PRESENT" if observation else None,
             "cooldown_remaining_ms": self._cooldown_remaining(now),
             "last_trigger_time": self._last_trigger_wall_time,
@@ -388,4 +742,10 @@ class TextTrigger:
             "recovery_pending": bool(self.memory.get("recovery_pending")),
             "recovery_token": int(self.memory.get("recovery_token", 0)),
             "recovery_reason": self.memory.get("last_recovery_reason"),
+            "disappear_burst_active": burst_active,
+            "disappear_burst_id": self._disappear_burst_id,
+            "disappear_evidence_count": len(self._disappear_evidence),
+            "disappear_valid_sample_count": self._disappear_valid_samples,
+            "disappear_burst_elapsed_ms": burst_elapsed_ms,
+            "disappear_burst_maximum_ms": 1800,
         }

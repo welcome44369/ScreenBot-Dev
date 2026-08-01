@@ -10,6 +10,7 @@ from pathlib import Path
 import platform
 import re
 import sys
+import time
 import traceback
 
 from PIL import ImageStat
@@ -156,6 +157,17 @@ class TargetCaptureService:
                     )
                 self._backend_cache[key] = name
                 self._runtime_capture_count += 1
+                frame_sequence = result.metadata.get("frame_sequence")
+                capture_component = (
+                    frame_sequence
+                    if frame_sequence is not None
+                    else self._runtime_capture_count
+                )
+                result.metadata.setdefault(
+                    "capture_id",
+                    f"{result.backend}:{result.metadata.get('capture_session_id') or hwnd}:{capture_component}",
+                )
+                result.metadata.setdefault("captured_monotonic", time.monotonic())
                 self._runtime_last_backend = result.backend
                 self._runtime_last_session_id = result.metadata.get("capture_session_id")
                 if result.metadata.get("session_recreated"):

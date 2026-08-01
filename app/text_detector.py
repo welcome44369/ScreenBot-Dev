@@ -1,4 +1,6 @@
 import logging
+import time
+from uuid import uuid4
 
 import pytesseract
 from app.target_capture import TargetCaptureService
@@ -25,17 +27,30 @@ class TextDetector:
         )
 
     def capture_region(self, region):
+        image, _metadata = self.capture_region_with_metadata(region)
+        return image
+
+    def capture_region_with_metadata(self, region):
         target = self.window_tracker.target
         if target is None:
             raise RuntimeError("No locked target window")
-        image = self.capture_client_image(int(target.hwnd), allow_desktop_fallback=False)
+        capture = self.capture_service.capture_target_client_result(
+            int(target.hwnd),
+            allow_desktop_fallback=False,
+        )
+        image = capture.image
         left = int(round(region["x_ratio"] * image.width))
         top = int(round(region["y_ratio"] * image.height))
         right = int(round((region["x_ratio"] + region["width_ratio"]) * image.width))
         bottom = int(round((region["y_ratio"] + region["height_ratio"]) * image.height))
         if right <= left or bottom <= top:
             raise ValueError("Invalid OCR region dimensions")
-        return image.crop((left, top, right, bottom))
+        metadata = dict(capture.metadata)
+        metadata.setdefault("captured_monotonic", time.monotonic())
+        metadata["root_hwnd"] = int(
+            getattr(target, "root_hwnd", target.hwnd)
+        )
+        return image.crop((left, top, right, bottom)), metadata
 
     def detect_text(self, region):
         image = self.capture_region(region)
@@ -44,13 +59,25 @@ class TextDetector:
     def observe_text(self, region, target_text, observation_config=None):
         """Capture once, run formal OCR once, then return a four-state result."""
         engine = ObservationEngine(observation_config)
+        observation_id = f"observation-{uuid4().hex}"
         try:
-            image = self.capture_region(region)
+            image, metadata = self.capture_region_with_metadata(region)
+            metadata["observation_id"] = observation_id
             recognized = self.recognize_image(image)["clean_text"]
-            return engine.observe(target_text, recognized, image)
+            return engine.observe(target_text, recognized, image, metadata=metadata)
         except Exception as exc:
             self.logger.warning("OBSERVATION_INVALID reason=%s", exc)
-            return engine.observe(target_text, "", None, valid=False, reason=str(exc))
+            return engine.observe(
+                target_text,
+                "",
+                None,
+                valid=False,
+                reason=str(exc),
+                metadata={
+                    "observation_id": observation_id,
+                    "captured_monotonic": time.monotonic(),
+                },
+            )
 
     def recognize_image(self, image, *, layout_hint="multi_line"):
         """Use the same confidence-aware OCR path as the Trigger Wizard."""

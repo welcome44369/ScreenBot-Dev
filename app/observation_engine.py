@@ -46,6 +46,15 @@ class ObservationResult:
     recognized_text: str
     target_text: str
     readability: ReadabilityResult | None = None
+    observation_id: str | None = None
+    capture_id: str | None = None
+    captured_monotonic: float | None = None
+    session_id: str | None = None
+    generation: int | None = None
+    root_hwnd: int | None = None
+    burst_id: str | None = None
+    run_id: str | None = None
+    trigger_id: str | None = None
 
     def as_dict(self):
         result = asdict(self)
@@ -128,21 +137,49 @@ class ObservationEngine:
         if config:
             self.config.update({key: value for key, value in config.items() if key in self.config})
 
-    def observe(self, target_text, recognized_text, image=None, *, valid=True, reason=""):
+    def observe(
+        self,
+        target_text,
+        recognized_text,
+        image=None,
+        *,
+        valid=True,
+        reason="",
+        metadata=None,
+    ):
+        metadata = dict(metadata or {})
+        observation_metadata = {
+            key: metadata.get(key)
+            for key in (
+                "observation_id",
+                "capture_id",
+                "captured_monotonic",
+                "session_id",
+                "generation",
+                "root_hwnd",
+                "burst_id",
+                "run_id",
+                "trigger_id",
+            )
+        }
         targets = [target_text] if isinstance(target_text, str) else list(target_text or [])
         targets = [value for value in targets if value]
         target = max(targets, key=lambda value: calculate_text_similarity(value, recognized_text), default="")
         if not valid:
-            return ObservationResult("INVALID", False, 0.0, 0.0, None, 0.0, False, reason or "invalid_observation", recognized_text or "", target)
+            return ObservationResult("INVALID", False, 0.0, 0.0, None, 0.0, False, reason or "invalid_observation", recognized_text or "", target, **observation_metadata)
         readability = analyze_region_readability(image) if image is not None else ReadabilityResult(1.0, 1.0, 1.0, False, False, False)
         if readability.score < self.config["invalid_readability_threshold"]:
-            return ObservationResult("INVALID", False, 0.0, readability.score, None, 0.0, False, readability.reason or "unreadable_region", recognized_text or "", target, readability)
+            return ObservationResult("INVALID", False, 0.0, readability.score, None, 0.0, False, readability.reason or "unreadable_region", recognized_text or "", target, readability, **observation_metadata)
         normalized = _normalize(recognized_text)
         exact = any(_normalize(value) in normalized for value in targets)
         similarity = 1.0 if exact else calculate_text_similarity(target, recognized_text)
         presence = similarity * self.config["text_weight"] + readability.score * self.config["readability_weight"]
         if exact or (similarity >= 0.90 and presence >= self.config["present_threshold"]):
             state, observation_reason = "PRESENT", "exact_match" if exact else "high_presence"
+        elif not normalized:
+            # An empty OCR string is indistinguishable from a transient OCR
+            # miss. It can never be positive disappearance evidence.
+            state, observation_reason = "UNCERTAIN", "empty_ocr"
         # A readable crop does not prove that the target is present, but it
         # deliberately creates a gray zone around low-confidence OCR.  ABSENT
         # is reserved for observations whose combined presence score is low.
@@ -153,4 +190,17 @@ class ObservationEngine:
             state, observation_reason = "UNCERTAIN", "near_match"
         else:
             state, observation_reason = "ABSENT", "low_presence"
-        return ObservationResult(state, exact, similarity, readability.score, None, presence, True, observation_reason, recognized_text or "", target, readability)
+        return ObservationResult(
+            state,
+            exact,
+            similarity,
+            readability.score,
+            None,
+            presence,
+            True,
+            observation_reason,
+            recognized_text or "",
+            target,
+            readability,
+            **observation_metadata,
+        )

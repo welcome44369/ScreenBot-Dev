@@ -39,9 +39,9 @@ def normalize_condition(condition=None, event=None):
             raise ValueError("condition.mode must be initial, edge, or state and desired_state must be present or absent")
         return condition_from_code(code), None
     if event == "appear":
-        return {"mode": "legacy", "desired_state": "present"}, LEGACY_APPEAR
+        return {"mode": "edge", "desired_state": "present"}, None
     if event == "disappear":
-        return {"mode": "legacy", "desired_state": "absent"}, LEGACY_DISAPPEAR
+        return {"mode": "edge", "desired_state": "absent"}, None
     raise ValueError("Text trigger requires a valid condition or legacy event")
 
 
@@ -50,7 +50,10 @@ def ui_code_from_trigger(trigger):
     code = condition_code(trigger.get("condition"))
     if code:
         return code
-    return {"appear": LEGACY_APPEAR, "disappear": LEGACY_DISAPPEAR}.get(trigger.get("event"))
+    return {
+        "appear": "edge_present",
+        "disappear": "edge_absent",
+    }.get(trigger.get("event"))
 
 
 def label_for_code(code):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 import sys
 import unittest
 
@@ -11,7 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.observation_engine import ObservationEngine, analyze_region_readability, calculate_text_similarity
+from app.observation_engine import (
+    ObservationEngine,
+    ObservationResult,
+    analyze_region_readability,
+    calculate_text_similarity,
+)
 from app.text_trigger import TextTrigger
 
 
@@ -39,7 +45,8 @@ class ObservationEngineTest(unittest.TestCase):
         self.assertEqual(self.observe("尋找採集").state, "UNCERTAIN")
         self.assertEqual(self.observe("尋找採").state, "UNCERTAIN")
         self.assertEqual(self.observe("尋找控物").state, "UNCERTAIN")
-        self.assertEqual(self.observe("").state, "ABSENT")
+        self.assertEqual(self.observe("").state, "UNCERTAIN")
+        self.assertEqual(self.observe("").reason, "empty_ocr")
 
     def test_invalid_uniform_crop_never_means_absent(self):
         result = self.engine.observe(TARGET, "", Image.new("RGB", (20, 20), "white"))
@@ -66,33 +73,68 @@ class ObservationEngineTest(unittest.TestCase):
         for now in (0.0, 0.2, 0.4):
             trigger.update(self.observe(TARGET), now=now)
         trigger.update(self.observe(""), now=1.0)
-        self.assertEqual(trigger.get_status_snapshot()["absent_frames"], 1)
+        self.assertEqual(trigger.get_status_snapshot()["absent_frames"], 0)
         invalid = self.engine.observe(TARGET, "", Image.new("RGB", (20, 20), "black"))
         trigger.update(invalid, now=2.0)
-        self.assertEqual(trigger.get_status_snapshot()["absent_frames"], 1)
+        self.assertEqual(trigger.get_status_snapshot()["absent_frames"], 0)
         trigger.update(self.observe("尋找採集"), now=3.0)
         self.assertEqual(trigger.get_status_snapshot()["absent_frames"], 0)
         self.assertEqual(trigger.get_status_snapshot()["state_machine_state"], "ARMED_PRESENT")
 
-    def test_disappear_requires_frames_and_monotonic_duration(self):
-        trigger = TextTrigger(TARGET, "disappear", confirm_frames=3, min_absent_duration_ms=5000)
-        for now in (0.0, 0.2, 0.4):
-            trigger.update(self.observe(TARGET), now=now)
-        self.assertFalse(trigger.update(self.observe(""), now=1.0).triggered)
-        self.assertFalse(trigger.update(self.observe(""), now=3.0).triggered)
-        fired = trigger.update(self.observe(""), now=6.1)
+    def test_disappear_uses_fresh_bounded_evidence(self):
+        trigger = TextTrigger(
+            TARGET,
+            "disappear",
+            confirm_frames=1,
+            min_absent_duration_ms=0,
+        )
+        present = replace(
+            self.observe(TARGET),
+            observation_id="present",
+            capture_id="present",
+            captured_monotonic=0.0,
+            session_id="session",
+            generation=1,
+            root_hwnd=100,
+        )
+        trigger.update(present, now=0.0)
+        fired = None
+        for index, now in enumerate((0.1, 0.35, 0.60, 0.85), 1):
+            absent = ObservationResult(
+                "ABSENT", False, 0.0, 0.9, None, 0.0, True,
+                "low_presence", "其他文字", TARGET,
+                observation_id=f"absent-{index}",
+                capture_id=f"capture-{index}",
+                captured_monotonic=now,
+                session_id="session", generation=1, root_hwnd=100,
+                burst_id=trigger.disappear_burst_id,
+            )
+            fired = trigger.update(absent, now=now)
         self.assertTrue(fired.triggered)
-        self.assertEqual(fired.event_name, "on_text_disappear")
+        self.assertEqual(fired.event_name, "on_text_edge_absent")
 
     def test_appear_remains_strict(self):
-        trigger = TextTrigger(TARGET, "appear", confirm_frames=2)
+        trigger = TextTrigger(
+            TARGET,
+            "appear",
+            confirm_frames=1,
+            min_absent_duration_ms=0,
+        )
         self.assertFalse(trigger.update(self.observe("尋找採集"), now=0.0).triggered)
         self.assertFalse(trigger.update(self.observe(TARGET), now=1.0).triggered)
-        self.assertTrue(trigger.update(self.observe(TARGET), now=2.0).triggered)
+        absent = ObservationResult(
+            "ABSENT", False, 0.0, 0.9, None, 0.0, True,
+            "low_presence", "其他文字", TARGET,
+        )
+        self.assertFalse(trigger.update(absent, now=2.0).triggered)
+        self.assertTrue(trigger.update(self.observe(TARGET), now=3.0).triggered)
 
-    def test_legacy_trigger_uses_conservative_duration_default(self):
+    def test_legacy_disappear_maps_to_edge_absent(self):
         trigger = TextTrigger(TARGET, "disappear", confirm_frames=3)
-        self.assertEqual(trigger.min_absent_duration_ms, 5000)
+        self.assertEqual(
+            trigger.condition, {"mode": "edge", "desired_state": "absent"}
+        )
+        self.assertIsNone(trigger.legacy_mode)
 
 
 if __name__ == "__main__":

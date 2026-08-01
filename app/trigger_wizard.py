@@ -143,9 +143,9 @@ class TriggerWizard(QDialog):
         if code:
             return code
         ui_code = ui_code_from_trigger(data)
-        if ui_code == LEGACY_APPEAR:
+        if ui_code in {LEGACY_APPEAR, "edge_present"}:
             return "edge_present"
-        if ui_code == LEGACY_DISAPPEAR:
+        if ui_code in {LEGACY_DISAPPEAR, "edge_absent"}:
             return "edge_absent"
         return None
 

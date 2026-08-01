@@ -517,6 +517,7 @@ class _WinsdkWgcSession:
         self.metadata: dict[str, Any] = {}
         self._image: Image.Image | None = None
         self._image_lock = threading.Lock()
+        self._frame_sequence = 0
         self._loop = None
         self._thread = threading.Thread(
             target=self._worker,
@@ -675,8 +676,11 @@ class _WinsdkWgcSession:
                 "RGBA", (width, height), bytes(raw), "raw", "BGRA"
             ).convert("RGB")
             with self._image_lock:
+                self._frame_sequence += 1
                 self._image = image
                 self.metadata["frame_size"] = [width, height]
+                self.metadata["frame_sequence"] = self._frame_sequence
+                self.metadata["captured_monotonic"] = time.monotonic()
             self.frame_ready.set()
             self.logger.debug("WGC_WINSDK_FRAME_RECEIVED PASS session_id=%s", self.session_id)
         except Exception as exc:

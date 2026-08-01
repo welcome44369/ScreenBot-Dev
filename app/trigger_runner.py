@@ -1,6 +1,7 @@
 import logging
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 
 from app.text_trigger import TextTrigger
@@ -36,7 +37,18 @@ class TriggerRunner:
         self._foreground_restored = True
         self._thread = None
         self._stop_event = threading.Event()
-        self._poll_interval_ms = trigger_config.get("poll_interval_ms", 500)
+        configured_interval = trigger_config.get("poll_interval_ms", 500)
+        if (
+            self.text_trigger is not None
+            and self.text_trigger.condition
+            == {"mode": "edge", "desired_state": "absent"}
+        ):
+            self._poll_interval_ms = max(
+                350, min(500, int(configured_interval))
+            )
+        else:
+            self._poll_interval_ms = configured_interval
+        self._burst_poll_interval_ms = 175
         self._macro_running = False
         self._macro_script = None
         self._status_lock = threading.Lock()
@@ -96,6 +108,15 @@ class TriggerRunner:
     def request_stop(self):
         """Request polling cancellation without joining the caller's thread."""
         self._stop_event.set()
+        if self.text_trigger is not None:
+            for condition_event in self.text_trigger.cancel_disappear_burst(
+                "runtime_stopped"
+            ):
+                self.logger.info(
+                    "%s %s",
+                    condition_event["event"],
+                    condition_event["data"],
+                )
 
     def is_active(self):
         return self._thread is not None and self._thread.is_alive()
@@ -127,6 +148,7 @@ class TriggerRunner:
                         self._stop_event.set()
                         self._publish_status()
                         break
+                    self._last_authorization = authorization
                     if self._input_suspended:
                         # Confirmation is ephemeral, while the supplied memory
                         # retains run-scoped edge/LOST state across suspension.
@@ -149,6 +171,49 @@ class TriggerRunner:
                     self.text_trigger.target_texts,
                     self.trigger_data["trigger"].get("observation"),
                 )
+                if self._input_safety_gate is not None:
+                    post_authorization = (
+                        self._input_safety_gate.authorize_foreground_input_fast(
+                            self._expected_target_session
+                        )
+                    )
+                    if not post_authorization.allowed:
+                        self._last_authorization = post_authorization
+                        self._last_error = (
+                            "target_unavailable:"
+                            f"{post_authorization.code.value}"
+                        )
+                        self._stop_event.set()
+                        self._publish_status()
+                        break
+                    self._last_authorization = post_authorization
+                authorization_snapshot = getattr(
+                    self._last_authorization, "snapshot", None
+                )
+                if hasattr(observation, "session_id"):
+                    observation = replace(
+                        observation,
+                        session_id=getattr(
+                            authorization_snapshot,
+                            "session_id",
+                            observation.session_id,
+                        ),
+                        generation=getattr(
+                            authorization_snapshot,
+                            "generation",
+                            observation.generation,
+                        ),
+                        root_hwnd=getattr(
+                            authorization_snapshot,
+                            "root_hwnd",
+                            observation.root_hwnd,
+                        ),
+                        burst_id=self.text_trigger.disappear_burst_id,
+                        trigger_id=(
+                            self.trigger_data["trigger"].get("id")
+                            or self.trigger_data.get("name")
+                        ),
+                    )
 
                 ocr_text = observation.recognized_text
                 result = self.text_trigger.update(observation)
@@ -262,7 +327,13 @@ class TriggerRunner:
             self._publish_status()
 
     def _wait_interval(self):
-        self._stop_event.wait(self._poll_interval_ms / 1000.0)
+        interval = (
+            self._burst_poll_interval_ms
+            if self.text_trigger is not None
+            and self.text_trigger.is_disappear_burst_active()
+            else self._poll_interval_ms
+        )
+        self._stop_event.wait(interval / 1000.0)
 
     def _new_text_trigger(self):
         trigger_config = self.trigger_data["trigger"]
