@@ -1,8 +1,12 @@
-﻿import ctypes
+import ctypes
 import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication, QMessageBox
+
+import app
+import app.trigger_manager
+import app.trigger_wizard
 
 from app.application import ScreenBotApp
 

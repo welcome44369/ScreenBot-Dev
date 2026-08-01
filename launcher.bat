@@ -1,8 +1,40 @@
 @echo off
-pushd "%~dp0"
-if exist .venv\Scripts\pythonw.exe (
-    .venv\Scripts\pythonw.exe main.py
-) else (
-    pythonw main.py
+setlocal
+
+set "SCREENBOT_ROOT=%~dp0"
+cd /d "%SCREENBOT_ROOT%"
+
+set "PYTHON_EXE=%LocalAppData%\Programs\Python\Python311\pythonw.exe"
+if not exist "%PYTHON_EXE%" (
+    set "PYTHON_EXE=%LocalAppData%\Programs\Python\Python311\python.exe"
 )
-popd
+
+set "MAIN_PY=%SCREENBOT_ROOT%main.py"
+
+if not exist "%PYTHON_EXE%" (
+    echo ScreenBot Dev launch failed.
+    echo.
+    echo Python:
+    echo %PYTHON_EXE%
+    echo.
+    echo Main:
+    echo %MAIN_PY%
+    pause
+    exit /b 1
+)
+
+if not exist "%MAIN_PY%" (
+    echo ScreenBot Dev launch failed.
+    echo.
+    echo Python:
+    echo %PYTHON_EXE%
+    echo.
+    echo Main:
+    echo %MAIN_PY%
+    pause
+    exit /b 1
+)
+
+start "" "%PYTHON_EXE%" "%MAIN_PY%"
+
+endlocal
