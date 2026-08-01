@@ -117,6 +117,9 @@ class ScreenBotApp:
         self._trigger_manager = None
         self._workflow_manager = None
         self._macro_manager = None
+        self._shutdown_requested = False
+        self._shutdown_completed = False
+        self._shutdown_reason = None
 
         self.app = QApplication([])
         self.app.setQuitOnLastWindowClosed(False)
@@ -150,6 +153,9 @@ class ScreenBotApp:
         self.widget.workflow_selected.connect(self._select_workflow)
         self.widget.start_workflow.connect(self._start_workflow_from_ui)
         self.widget.stop_workflow.connect(self._stop_workflow_from_ui)
+        self.widget.workflow_execution_panel_visibility_changed.connect(
+            self._on_workflow_execution_panel_visibility_changed
+        )
         self.widget.refresh_workflows.connect(self._refresh_workflows)
         self.widget.export_runtime_log.connect(self._export_runtime_log)
         self.widget.open_runtime_log_folder.connect(self.open_runtime_log_folder)
@@ -476,9 +482,10 @@ class ScreenBotApp:
     def _collapse_ui_for_workflow_execution(self):
         """Perform and acknowledge the one-shot UI collapse before handoff."""
         if self.workflow_execution_ui_state in {
-            "COLLAPSING", "COLLAPSED_ARMED", "RUNNING_COLLAPSED"
+            "COLLAPSING", "COLLAPSED_ARMED", "RUNNING_COLLAPSED", "RUNNING_EXPANDED"
         }:
             return True
+        ui_state_before = self.workflow_execution_ui_state
         self.workflow_execution_ui_state = "COLLAPSING"
         collapse = getattr(self.widget, "collapse_for_workflow_execution", None)
         if not callable(collapse):
@@ -496,12 +503,23 @@ class ScreenBotApp:
             self.workflow_execution_ui_state = "IDLE_EXPANDED"
             return False
         self.workflow_execution_ui_state = "COLLAPSED_ARMED"
-        self._record_overlay_diagnostic("WORKFLOW_UI_COLLAPSED")
+        workflow_diagnostics = getattr(self, "workflow_diagnostics", None)
+        workflow_data = getattr(self, "workflow_data", None)
+        self._record_overlay_diagnostic(
+            "WORKFLOW_UI_AUTO_COLLAPSED",
+            ui_state_before=ui_state_before,
+            ui_state_after=self.workflow_execution_ui_state,
+            execution_id=getattr(workflow_diagnostics, "current_run_id", None),
+            workflow_id=(workflow_data or {}).get("id") if isinstance(workflow_data, dict) else None,
+            target_session_id=self._target_session_id_for_diagnostics(),
+            reason="explicit_start_request",
+        )
         return True
 
     def _restore_ui_after_workflow_execution(self, reason):
         """Restore once for every terminal/cancelled/failed start path."""
-        if self.workflow_execution_ui_state == "IDLE_EXPANDED":
+        state_before = getattr(self, "workflow_execution_ui_state", "IDLE_EXPANDED")
+        if state_before == "IDLE_EXPANDED":
             return True
         self.workflow_execution_ui_state = "RESTORING"
         restore = getattr(self.widget, "restore_after_workflow_execution", None)
@@ -512,8 +530,51 @@ class ScreenBotApp:
         except (RuntimeError, TypeError) as exc:
             self.logger.error("Workflow UI restore failed: %s", exc)
         self.workflow_execution_ui_state = "IDLE_EXPANDED"
-        self._record_overlay_diagnostic("WORKFLOW_UI_RESTORED", reason=reason, restored=restored)
+        workflow_diagnostics = getattr(self, "workflow_diagnostics", None)
+        workflow_data = getattr(self, "workflow_data", None)
+        self._record_overlay_diagnostic(
+            "WORKFLOW_UI_TERMINAL_RESTORED",
+            reason=reason,
+            restored=restored,
+            ui_state_before=state_before,
+            ui_state_after=self.workflow_execution_ui_state,
+            execution_id=getattr(workflow_diagnostics, "current_run_id", None),
+            workflow_id=(workflow_data or {}).get("id") if isinstance(workflow_data, dict) else None,
+            target_session_id=self._target_session_id_for_diagnostics(),
+        )
         return restored
+
+    def _target_session_id_for_diagnostics(self):
+        target_session = getattr(self, "target_session", None)
+        if target_session is None:
+            return None
+        snapshot_getter = getattr(target_session, "get_snapshot", None)
+        if not callable(snapshot_getter):
+            return None
+        try:
+            snapshot = snapshot_getter()
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+        return getattr(snapshot, "session_id", None)
+
+    def _on_workflow_execution_panel_visibility_changed(self, expanded):
+        if self.workflow_execution_ui_state not in {
+            "COLLAPSED_ARMED", "RUNNING_COLLAPSED", "RUNNING_EXPANDED"
+        }:
+            return
+        ui_state_before = self.workflow_execution_ui_state
+        self.workflow_execution_ui_state = "RUNNING_EXPANDED" if expanded else "RUNNING_COLLAPSED"
+        workflow_diagnostics = getattr(self, "workflow_diagnostics", None)
+        workflow_data = getattr(self, "workflow_data", None)
+        self._record_overlay_diagnostic(
+            "WORKFLOW_UI_MANUAL_EXPANDED" if expanded else "WORKFLOW_UI_MANUAL_COLLAPSED",
+            ui_state_before=ui_state_before,
+            ui_state_after=self.workflow_execution_ui_state,
+            execution_id=getattr(workflow_diagnostics, "current_run_id", None),
+            workflow_id=(workflow_data or {}).get("id") if isinstance(workflow_data, dict) else None,
+            target_session_id=self._target_session_id_for_diagnostics(),
+            reason="user_toggle",
+        )
 
     def _on_start_handoff_tick(self):
         self._attempt_start_handoff()
@@ -712,7 +773,12 @@ class ScreenBotApp:
             self._record_start_handoff_event(
                 "START_REQUEST_STARTED", completed.snapshot, request=completed.request
             )
-            self.workflow_execution_ui_state = "RUNNING_COLLAPSED"
+            collapsed_now = getattr(
+                self.widget, "is_workflow_execution_collapsed", lambda: False
+            )()
+            self.workflow_execution_ui_state = (
+                "RUNNING_COLLAPSED" if collapsed_now else "RUNNING_EXPANDED"
+            )
         else:
             completed = self.start_handoff.complete_failed(request.request_id, failure_reason)
             self._record_start_handoff_event(
@@ -1003,14 +1069,29 @@ class ScreenBotApp:
     def confirm_exit(self):
         result = ask_confirmation(self.widget, "確認退出", "確定要退出 ScreenBot 嗎？")
         if result == QMessageBox.Yes:
-            self.shutdown()
+            self.request_shutdown("user_exit_confirmed")
+
+    def request_shutdown(self, reason="application_shutdown"):
+        if self._shutdown_completed or self._shutdown_requested:
+            return False
+        self._shutdown_requested = True
+        self._shutdown_reason = reason
+        self.logger.info("Shutdown requested: %s", reason)
+        self._shutdown_in_progress = True
+        if getattr(self.widget, "_suppress_exit_requests", False) is False:
+            self.widget._suppress_exit_requests = True
+        self.shutdown()
+        return True
 
     def shutdown(self):
+        if self._shutdown_completed:
+            return
+        self._shutdown_completed = True
         self.logger.info("關閉 ScreenBot")
         self.countdown_timer.stop()
         self.start_handoff_timer.stop()
-        self._cancel_armed_start("application_shutdown")
         self.workflow_ui_timer.stop()
+        self._cancel_armed_start("application_shutdown")
         self.stop_workflow()
         self.stop_text_trigger()
         if self.state == AppState.RECORDING:
@@ -1018,7 +1099,8 @@ class ScreenBotApp:
                 self.recorder.stop()
             except Exception:
                 pass
-        self.recorder_overlay.destroy()
+        if self.recorder_overlay is not None:
+            self.recorder_overlay.destroy()
         if self.player.is_active():
             self.player.stop()
         self.text_detector.close()
@@ -1880,7 +1962,7 @@ class ScreenBotApp:
         self.widget.set_workflow_runtime_info(info)
         self.widget.set_workflow_running(status in {"STARTING", "WAIT_TRIGGER", "RUNNING_MACRO", "STOPPING"})
         if (
-            self.workflow_execution_ui_state == "RUNNING_COLLAPSED"
+            self.workflow_execution_ui_state in {"RUNNING_COLLAPSED", "RUNNING_EXPANDED"}
             and snapshot.get("state") in {"FINISHED", "STOPPED", "ERROR"}
         ):
             self._restore_ui_after_workflow_execution(snapshot.get("state", "terminal").lower())

@@ -72,6 +72,7 @@ class FloatingWidget(QWidget):
     compact_hwnd_changed = Signal(int, int)
     compact_geometry_changed = Signal()
     compact_visibility_intent_changed = Signal(bool)
+    workflow_execution_panel_visibility_changed = Signal(bool)
     run_ocr_process_probe = Signal()
 
     def __init__(self, root_path, native_no_activate_adapter=None, overlay_diagnostics=None):
@@ -86,6 +87,7 @@ class FloatingWidget(QWidget):
         self._ui_visibility_intent = True
         self._coordinator_visibility_change = False
         self._target_visibility_suppressed = False
+        self._suppress_exit_requests = False
         self._ocr_process_diagnostic_enabled = (
             os.environ.get("SCREENBOT_OCR_PROCESS_DIAGNOSTIC") == "1"
         )
@@ -93,8 +95,10 @@ class FloatingWidget(QWidget):
         self.drag_started = False
         self.expanded = False
         self.runtime_debug_expanded = False
+        self._workflow_execution_active = False
         self._workflow_execution_collapsed = False
         self._workflow_previous_expanded = False
+        self._workflow_runtime_summary = {}
         self._compact_status_view = None
         self._native_no_activate_adapter = native_no_activate_adapter or WindowsNoActivateAdapter(
             observer=overlay_diagnostics
@@ -202,6 +206,26 @@ class FloatingWidget(QWidget):
         self.header.addWidget(self.status_label)
         self.main_layout.addLayout(self.header)
 
+        self.workflow_running_strip = QWidget()
+        self.workflow_running_strip_layout = QHBoxLayout(self.workflow_running_strip)
+        self.workflow_running_strip_layout.setContentsMargins(2, 0, 2, 0)
+        self.workflow_running_strip_layout.setSpacing(6)
+        self.workflow_running_strip_label = QLabel("工作流執行中")
+        self.workflow_running_strip_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.workflow_running_expand_button = QPushButton("展開")
+        self.workflow_running_expand_button.setFocusPolicy(Qt.NoFocus)
+        self.workflow_running_expand_button.setFixedHeight(24)
+        self.workflow_running_expand_button.setToolTip("展開完整工作流監控面板")
+        self.workflow_running_stop_button = QPushButton("停止")
+        self.workflow_running_stop_button.setFocusPolicy(Qt.NoFocus)
+        self.workflow_running_stop_button.setFixedHeight(24)
+        self.workflow_running_stop_button.setToolTip("停止目前工作流")
+        self.workflow_running_strip_layout.addWidget(self.workflow_running_strip_label, 1)
+        self.workflow_running_strip_layout.addWidget(self.workflow_running_expand_button)
+        self.workflow_running_strip_layout.addWidget(self.workflow_running_stop_button)
+        self.workflow_running_strip.setVisible(False)
+        self.main_layout.addWidget(self.workflow_running_strip)
+
         self.primary_actions = QHBoxLayout()
         self.trigger_action_button = QPushButton("偵測觸發點")
         self.macro_action_button = QPushButton("巨集管理")
@@ -248,18 +272,22 @@ class FloatingWidget(QWidget):
         workflow_button_row = QHBoxLayout()
         self.start_workflow_button = QPushButton("開始")
         self.stop_workflow_button = QPushButton("停止")
+        self.workflow_toggle_button = QPushButton("收合")
         self.refresh_workflow_button = QPushButton("重新整理")
         self.export_runtime_log_button = QPushButton("匯出 Log")
         self.open_runtime_log_folder_button = QPushButton("Run Logs")
-        for button in (self.start_workflow_button, self.stop_workflow_button, self.refresh_workflow_button, self.export_runtime_log_button, self.open_runtime_log_folder_button):
+        for button in (self.start_workflow_button, self.stop_workflow_button, self.workflow_toggle_button, self.refresh_workflow_button, self.export_runtime_log_button, self.open_runtime_log_folder_button):
             button.setFocusPolicy(Qt.NoFocus)
             button.setFixedHeight(26)
         workflow_button_row.addWidget(self.start_workflow_button)
         workflow_button_row.addWidget(self.stop_workflow_button)
+        workflow_button_row.addWidget(self.workflow_toggle_button)
         workflow_button_row.addWidget(self.refresh_workflow_button)
         workflow_button_row.addWidget(self.export_runtime_log_button)
         workflow_button_row.addWidget(self.open_runtime_log_folder_button)
         self.details_layout.addLayout(workflow_button_row)
+        self.workflow_toggle_button.setVisible(False)
+        self.workflow_toggle_button.setToolTip("收合完整工作流監控面板")
 
         self.workflow_status_label = QLabel("Workflow 狀態：IDLE")
         self.workflow_name_label = QLabel("Workflow：(未選擇)")
@@ -369,6 +397,9 @@ class FloatingWidget(QWidget):
         self.opacity_combo.currentIndexChanged.connect(self._on_opacity_changed)
         self.start_workflow_button.clicked.connect(lambda: self.start_workflow.emit())
         self.stop_workflow_button.clicked.connect(lambda: self.stop_workflow.emit())
+        self.workflow_toggle_button.clicked.connect(self.toggle_workflow_execution_panel)
+        self.workflow_running_expand_button.clicked.connect(self.toggle_workflow_execution_panel)
+        self.workflow_running_stop_button.clicked.connect(lambda: self.stop_workflow.emit())
         self.refresh_workflow_button.clicked.connect(lambda: self.refresh_workflows.emit())
         self.export_runtime_log_button.clicked.connect(lambda: self.export_runtime_log.emit())
         self.open_runtime_log_folder_button.clicked.connect(lambda: self.open_runtime_log_folder.emit())
@@ -484,6 +515,7 @@ class FloatingWidget(QWidget):
             label.setStyleSheet(chip_style)
         self.target_label.setToolTip(view.get("target_full_title") or "")
         self._compact_status_view = view
+        self._update_workflow_running_strip_text()
 
     def set_status(self, state, countdown_text=None):
         """Compatibility wrapper; final compact fields still use one renderer."""
@@ -539,6 +571,7 @@ class FloatingWidget(QWidget):
             self.workflow_combo.setCurrentIndex(0)
 
     def set_workflow_runtime_info(self, info):
+        self._workflow_runtime_summary = dict(info or {})
         status = info.get("status", "IDLE")
         workflow_name = info.get("workflow_name") or "(未選擇)"
         self.workflow_section_label.setText(f"工作流： {workflow_name}")
@@ -572,12 +605,15 @@ class FloatingWidget(QWidget):
             self.workflow_timeline_label.setText("Timeline：\n" + "\n".join(timeline_lines))
         else:
             self.workflow_timeline_label.setText("Timeline：\n(無)")
+        self._update_workflow_running_strip_text()
 
     def set_workflow_running(self, running):
         self.workflow_combo.setEnabled(not running)
         self.start_workflow_button.setEnabled(not running)
         self.refresh_workflow_button.setEnabled(not running)
         self.stop_workflow_button.setEnabled(running)
+        self.workflow_running_stop_button.setEnabled(running)
+        self._refresh_workflow_execution_controls()
 
     def set_ocr_process_probe_state(
         self, running=False, message=None, completed=False
@@ -624,6 +660,51 @@ class FloatingWidget(QWidget):
         view = dict(self._compact_status_view or {})
         view["target_full_title"] = title
         self._compact_status_view = view
+        self._update_workflow_running_strip_text()
+
+    def _update_workflow_running_strip_text(self):
+        if not hasattr(self, "workflow_running_strip_label"):
+            return
+        info = self._workflow_runtime_summary or {}
+        workflow_name = info.get("workflow_name") or "(未選擇)"
+        status = info.get("status") or "IDLE"
+        cycle = info.get("current_cycle") or info.get("completed_cycles") or 0
+        step_number = info.get("step_number", 0)
+        total_steps = info.get("total_steps", 0)
+        step_text = f"{step_number}/{total_steps}" if total_steps else "0/0"
+        target_text = (self._compact_status_view or {}).get("target_text") or "目標：未鎖定"
+        self.workflow_running_strip_label.setText(
+            f"{target_text}｜{workflow_name}｜{status}｜循環 {cycle}｜步驟 {step_text}"
+        )
+
+    def _refresh_workflow_execution_controls(self):
+        active = bool(self._workflow_execution_active)
+        collapsed = bool(self._workflow_execution_collapsed)
+        self.workflow_running_strip.setVisible(active and collapsed)
+        self.workflow_toggle_button.setVisible(active and not collapsed)
+        self.workflow_toggle_button.setEnabled(active and not collapsed)
+
+    def set_workflow_execution_panel_expanded(self, expanded):
+        if not self._workflow_execution_active:
+            return False
+        expanded = bool(expanded)
+        self.expanded = expanded
+        self._workflow_execution_collapsed = not expanded
+        if not expanded:
+            self.runtime_debug_expanded = False
+            for item in self._runtime_debug_widgets:
+                item.setVisible(False)
+            self.runtime_debug_toggle.setText("▶ Runtime Debug")
+        self.details_widget.setVisible(expanded)
+        self.adjustSize()
+        self._refresh_workflow_execution_controls()
+        self.workflow_execution_panel_visibility_changed.emit(expanded)
+        return (not self.details_widget.isHidden()) == expanded
+
+    def toggle_workflow_execution_panel(self):
+        if not self._workflow_execution_active:
+            return False
+        return self.set_workflow_execution_panel_expanded(self._workflow_execution_collapsed)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -662,7 +743,8 @@ class FloatingWidget(QWidget):
         super().mouseReleaseEvent(event)
 
     def toggle_panel(self):
-        if self._workflow_execution_collapsed:
+        if self._workflow_execution_active:
+            self.set_workflow_execution_panel_expanded(not self.expanded)
             return
         self.expanded = not self.expanded
         if self._diagnostics_enabled():
@@ -682,9 +764,10 @@ class FloatingWidget(QWidget):
         This is intentionally a presentation-only transition: it does not
         activate, move, raise, hide, or otherwise alter any target window.
         """
-        if self._workflow_execution_collapsed:
+        if self._workflow_execution_active and self._workflow_execution_collapsed:
             return True
         self._workflow_previous_expanded = bool(self.expanded)
+        self._workflow_execution_active = True
         self._workflow_execution_collapsed = True
         self.expanded = False
         self.runtime_debug_expanded = False
@@ -693,20 +776,27 @@ class FloatingWidget(QWidget):
         self.runtime_debug_toggle.setText("▶ Runtime Debug")
         self.details_widget.setVisible(False)
         self.adjustSize()
+        self._refresh_workflow_execution_controls()
         return not self.details_widget.isVisible()
 
     def restore_after_workflow_execution(self):
         """Restore the pre-start panel presentation exactly once."""
-        if not self._workflow_execution_collapsed:
+        if not self._workflow_execution_active:
             return True
+        self._workflow_execution_active = False
         self._workflow_execution_collapsed = False
-        self.expanded = self._workflow_previous_expanded
+        self.expanded = True
         self.details_widget.setVisible(self.expanded)
         self.adjustSize()
-        return self.details_widget.isVisible() == self.expanded
+        self._refresh_workflow_execution_controls()
+        return (not self.details_widget.isHidden()) == self.expanded
 
     def is_workflow_execution_collapsed(self):
-        return self._workflow_execution_collapsed and not self.details_widget.isVisible()
+        return (
+            self._workflow_execution_active
+            and self._workflow_execution_collapsed
+            and not self.details_widget.isVisible()
+        )
 
     def toggle_runtime_debug(self):
         self.runtime_debug_expanded = not self.runtime_debug_expanded
@@ -787,6 +877,8 @@ class FloatingWidget(QWidget):
             self._ui_visibility_intent = False
             self.compact_visibility_intent_changed.emit(False)
         self._observe_lifecycle("COMPACT_CLOSE_EVENT")
+        if not self._suppress_exit_requests:
+            self.exit_requested.emit()
         super().closeEvent(event)
 
     def moveEvent(self, event):
