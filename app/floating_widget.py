@@ -204,6 +204,9 @@ class FloatingWidget(QWidget):
         self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.header.addWidget(self.state_badge)
         self.header.addWidget(self.status_label)
+        self.hotkey_status_label = QLabel("")
+        self.hotkey_status_label.setVisible(False)
+        self.header.addWidget(self.hotkey_status_label)
         self.main_layout.addLayout(self.header)
 
         self.workflow_running_strip = QWidget()
@@ -534,6 +537,11 @@ class FloatingWidget(QWidget):
             "target_text": (self._compact_status_view or {}).get("target_text", "目標：未鎖定"),
             "operation_text": (self._compact_status_view or {}).get("operation_text", "請按 F8 鎖定目標視窗"),
         })
+
+    def set_hotkey_status(self, message, available):
+        self.hotkey_status_label.setText(str(message))
+        self.hotkey_status_label.setStyleSheet("color: #16a34a;" if available else "color: #dc2626;")
+        self.hotkey_status_label.setVisible(True)
 
     def set_script_list(self, scripts):
         self.combo.blockSignals(True)

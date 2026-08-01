@@ -223,7 +223,7 @@ class ScreenBotApp:
         self.widget.set_workflow_running(False)
         # Hotkey bridge and manager
         self.hotkey_bridge = HotkeyBridge()
-        self.hotkey_manager = HotkeyManager(self.hotkey_bridge, self.logger, self.settings.get("exit_hotkey", "esc"))
+        self.hotkey_manager = HotkeyManager(self.hotkey_bridge, self.logger, self.settings.get("exit_hotkey", "esc"), self._on_hotkey_status)
         # Connect bridge signals to slots (Qt main thread safe)
         self.hotkey_bridge.f8_pressed.connect(self._on_bridge_f8)
         self.hotkey_bridge.f9_pressed.connect(self._on_bridge_f9)
@@ -271,6 +271,13 @@ class ScreenBotApp:
                 self.logger.info("已解除所有熱鍵註冊")
         except Exception:
             self.logger.exception("_unregister_hotkeys failed")
+
+    def _on_hotkey_status(self, event, **data):
+        setter = getattr(self.widget, "set_hotkey_status", None)
+        if event == "HOTKEY_REGISTRATION_FAILED" and callable(setter):
+            setter(f"F8 unavailable: {data.get('error_type')}: {data.get('message')}", False)
+        elif event == "HOTKEY_REGISTERED" and callable(setter):
+            setter("F8 ready", True)
 
     def _change_background_opacity(self, value):
         self.settings.set("background_opacity", value)
@@ -326,7 +333,7 @@ class ScreenBotApp:
 
     def _on_bridge_f8(self):
         try:
-            self.logger.info(f"Hotkey bridge: F8 pressed; state={self.state.name}")
+            self.logger.info("HOTKEY_DISPATCHED key=F8 state=%s", self.state.name)
             self._handle_f8()
         except Exception:
             self.logger.exception("Exception handling bridge F8")
@@ -1398,11 +1405,11 @@ class ScreenBotApp:
 
     def _pause_global_hotkeys(self):
         if hasattr(self, "hotkey_manager"):
-            self.hotkey_manager.unregister_all()
+            self.hotkey_manager.pause(owner="trigger_manager")
 
     def _resume_global_hotkeys(self):
         if hasattr(self, "hotkey_manager"):
-            self.hotkey_manager.register_hotkeys()
+            self.hotkey_manager.resume(owner="trigger_manager")
 
     def open_workflow_manager(self):
         if self._workflow_manager is not None and self._workflow_manager.isVisible():
