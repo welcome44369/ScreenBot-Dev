@@ -190,11 +190,21 @@ class ScreenBotApp:
         def _on_click_recorded(payload):
             self.recorder_overlay_bridge.ripple_requested.emit(dict(payload))
 
+        def _on_recording_target_invalidated(reason):
+            QTimer.singleShot(
+                0,
+                lambda value=str(reason): self._on_recording_target_invalidated(
+                    value
+                ),
+            )
+
         self.recorder = ActionRecorder(
             self.window_tracker,
             self.settings,
             on_event=_on_event_count,
             on_click=_on_click_recorded,
+            target_session=self.target_session,
+            on_invalidated=_on_recording_target_invalidated,
         )
 
         self.state = AppState.IDLE
@@ -539,6 +549,12 @@ class ScreenBotApp:
 
     def _start_script(self):
         """Arm the current script; actual input startup occurs only after handoff."""
+        recorder = getattr(self, "recorder", None)
+        if self.state == AppState.RECORDING or (
+            recorder is not None and recorder.is_recording()
+        ):
+            self._show_message("錄製進行中", "請先停止錄製，再執行單獨腳本。")
+            return
         if self.workflow_runner.is_active():
             self._show_message("Workflow 執行中", "請先停止 Workflow，再執行單獨腳本。")
             self.set_state(AppState.IDLE)
@@ -975,10 +991,27 @@ class ScreenBotApp:
     def start_recording(self):
         if self.state == AppState.RECORDING:
             return
+        if self.state != AppState.IDLE:
+            self._show_message("目前無法錄製", "請先停止目前工作，再開始錄製。")
+            return
         if self.workflow_runner.is_active():
             self._show_message("Workflow 執行中", "Workflow 執行期間不可開始錄製。")
             return
-        if self.window_tracker.target is None:
+        if self.player.is_active() or self.state in {AppState.RUNNING, AppState.PAUSED}:
+            self._show_message("腳本播放中", "腳本播放期間不可開始錄製。")
+            return
+        handoff = getattr(self, "start_handoff", None)
+        handoff_snapshot = (
+            handoff.get_snapshot() if handoff is not None else None
+        )
+        if handoff_snapshot is not None and handoff_snapshot.state in {
+            StartHandoffState.ARMED,
+            StartHandoffState.COMMITTING,
+        }:
+            self._show_message("執行啟動中", "請先取消待執行工作，再開始錄製。")
+            return
+        snapshot = self.target_session.get_snapshot()
+        if snapshot is None or not snapshot.identity_valid:
             self._show_message("請先鎖定目標視窗", "請先使用 F8 鎖定前景視窗，再開始錄製。")
             return
         try:
@@ -996,10 +1029,10 @@ class ScreenBotApp:
             self._show_message("開始錄製失敗", str(exc))
             self.set_state(AppState.ERROR)
 
-    def stop_recording(self):
+    def stop_recording(self, reason="normal_stop"):
         if self.state != AppState.RECORDING:
             return
-        script = self.recorder.stop()
+        script = self.recorder.stop(reason=reason)
         self.recorder_overlay.stop()
         if script:
             # keep recording in memory but do not prompt save automatically
@@ -1010,6 +1043,12 @@ class ScreenBotApp:
         self.set_state(AppState.IDLE)
         if self._macro_manager is not None:
             self._macro_manager.update_state("IDLE", len(script.get("events", [])) if script else 0)
+
+    def _on_recording_target_invalidated(self, reason):
+        if self.state != AppState.RECORDING:
+            return
+        self.stop_recording(reason=reason)
+        self._show_message("目標失效", "目標失效，錄製已停止。")
 
     def save_recording(self):
         if not self.last_recording:
@@ -1315,6 +1354,9 @@ class ScreenBotApp:
         if self.workflow_runner.is_active():
             raise RuntimeError("Workflow is already running")
         if self.state == AppState.RECORDING:
+            raise RuntimeError("Cannot start workflow while recording")
+        recorder = getattr(self, "recorder", None)
+        if recorder is not None and recorder.is_recording():
             raise RuntimeError("Cannot start workflow while recording")
         if self.window_tracker.target is None:
             raise RuntimeError("請先鎖定目標視窗")

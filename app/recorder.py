@@ -15,6 +15,8 @@ import time
 from pynput import keyboard as pynput_keyboard
 from pynput import mouse as pynput_mouse
 
+from app.target_boundary import FrozenTargetBoundary, TargetBoundaryFilter
+
 
 HOTKEY_BLOCKLIST = {"f8", "f9", "esc"}
 CLICK_DISTANCE_PX = 6
@@ -62,9 +64,21 @@ class ActionRecorder:
     files remain readable by ``ScriptPlayer`` unchanged.
     """
 
-    def __init__(self, window_tracker, settings, on_event=None, on_click=None):
+    def __init__(
+        self,
+        window_tracker,
+        settings,
+        on_event=None,
+        on_click=None,
+        *,
+        target_session=None,
+        boundary_adapter=None,
+        on_invalidated=None,
+    ):
         self.window_tracker = window_tracker
         self.settings = settings
+        self.target_session = target_session
+        self._boundary_adapter = boundary_adapter
         self.logger = logging.getLogger("ScreenBot")
         self.actions = []
         self._lock = threading.RLock()
@@ -75,14 +89,22 @@ class ActionRecorder:
         self._recording = False
         self._accepting_events = False
         self._target_hwnd = None
+        self._frozen_boundary = None
+        self._boundary_filter = None
+        self._target_listener_registered = False
+        self._invalidation_notified = False
+        self._stop_reason = None
+        self._last_script = None
         self._start_time = None
         self._last_action_end = None
         self._pressed_keys = {}
         self._mouse_down = {}
+        self._raw_mouse_buttons = set()
         self._last_scroll = None
         self._focus_paused = False
         self.on_event = on_event
         self.on_click = on_click
+        self.on_invalidated = on_invalidated
         self._diagnostics = {}
         self._reset_diagnostics()
 
@@ -93,6 +115,9 @@ class ActionRecorder:
             "mouse_listener_running": False,
             "suppress_enabled": False,
             "target_hwnd": None,
+            "session_id": None,
+            "generation": None,
+            "stop_reason": None,
             "target_foreground": False,
             "raw_event_count": 0,
             "normalized_event_count": 0,
@@ -107,21 +132,36 @@ class ActionRecorder:
     def start(self):
         if self._recording:
             return
-        target = self.window_tracker.target
-        if target is None:
-            raise RuntimeError("Please lock a target window before recording.")
+        if self.target_session is None:
+            raise RuntimeError("Recording requires the authoritative TargetSession.")
+        snapshot = self.target_session.get_snapshot()
+        frozen = FrozenTargetBoundary.from_snapshot(snapshot)
         self.actions = []
         self._queue = Queue()
         self._pressed_keys.clear()
         self._mouse_down.clear()
+        self._raw_mouse_buttons.clear()
         self._last_scroll = None
         self._reset_diagnostics()
-        self._target_hwnd = int(target.hwnd)
+        self._frozen_boundary = frozen
+        self._boundary_filter = TargetBoundaryFilter(
+            self.target_session,
+            frozen,
+            adapter=self._boundary_adapter,
+        )
+        self._target_hwnd = frozen.client_hwnd
         self._diagnostics["target_hwnd"] = self._target_hwnd
+        self._diagnostics["session_id"] = frozen.session_id
+        self._diagnostics["generation"] = frozen.generation
+        self._stop_reason = None
+        self._last_script = None
+        self._invalidation_notified = False
         self._start_time = time.monotonic()
         self._last_action_end = self._start_time
         self._recording = True
         self._accepting_events = True
+        self.target_session.subscribe(self._on_target_session_event)
+        self._target_listener_registered = True
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="ScreenBot-MacroNormalizer",
@@ -148,7 +188,7 @@ class ActionRecorder:
             self._diagnostics["mouse_listener_running"] = True
             # Macro Manager may have received the start click.  Return focus
             # once at start only; no input callback ever changes foreground.
-            ctypes.windll.user32.SetForegroundWindow(self._target_hwnd)
+            ctypes.windll.user32.SetForegroundWindow(frozen.root_hwnd)
             self.logger.info(
                 "[MacroRecorder] Backend=pynput-win32 suppress=false Target HWND=0x%08X Passive recording started",
                 self._target_hwnd,
@@ -158,23 +198,32 @@ class ActionRecorder:
             self._recording = False
             self._accepting_events = False
             self._stop_listeners()
+            self._unsubscribe_target_session()
             self._queue.put(None)
             if self._worker is not None:
                 self._worker.join(timeout=2)
             raise RuntimeError(f"Unable to start passive input recorder: {exc}") from exc
 
-    def stop(self):
+    def stop(self, reason="normal_stop"):
         if not self._recording:
-            return None
+            return self._last_script
         self._accepting_events = False
         self._recording = False
+        self._stop_reason = self._stop_reason or str(reason)
+        self._diagnostics["stop_reason"] = self._stop_reason
+        self._unsubscribe_target_session()
         self._stop_listeners()
         self._queue.put(None)
-        if self._worker is not None:
+        if self._worker is not None and self._worker is not threading.current_thread():
             self._worker.join(timeout=3)
             self._worker = None
-        self._close_open_keys()
+        # Incomplete transactions are discarded. Recorder never fabricates a
+        # release event that was not observed inside the frozen boundary.
+        self._pressed_keys.clear()
         self._mouse_down.clear()
+        self._raw_mouse_buttons.clear()
+        self._last_scroll = None
+        self._diagnostics["open_key_count"] = 0
         self._diagnostics["open_mouse_button_count"] = 0
         duration_ms = int(round((time.monotonic() - self._start_time) * 1000)) if self._start_time else 0
         self.logger.info(
@@ -182,7 +231,8 @@ class ActionRecorder:
             self._diagnostics["raw_event_count"], self._diagnostics["normalized_event_count"],
             self._diagnostics["ignored_move_count"], duration_ms,
         )
-        return self._build_script()
+        self._last_script = self._build_script()
+        return self._last_script
 
     def is_recording(self):
         return self._recording
@@ -204,14 +254,22 @@ class ActionRecorder:
         self._enqueue("key_up", {"key": key})
 
     def _on_mouse_move(self, _x, _y):
-        if self._accepting_events:
-            with self._lock:
-                self._diagnostics["ignored_move_count"] += 1
+        with self._lock:
+            gesture_open = bool(self._raw_mouse_buttons)
+        if gesture_open:
+            self._enqueue("mouse_move", {"x": int(_x), "y": int(_y)})
 
     def _on_mouse_click(self, x, y, button, pressed):
+        button_name = _button_name(button)
+        with self._lock:
+            if pressed:
+                self._raw_mouse_buttons.add(button_name)
         self._enqueue("mouse_down" if pressed else "mouse_up", {
-            "x": int(x), "y": int(y), "button": _button_name(button),
+            "x": int(x), "y": int(y), "button": button_name,
         })
+        if not pressed:
+            with self._lock:
+                self._raw_mouse_buttons.discard(button_name)
 
     def _on_mouse_scroll(self, x, y, dx, dy):
         self._enqueue("scroll", {
@@ -253,6 +311,8 @@ class ActionRecorder:
             self._normalize_key(raw)
         elif raw.kind in {"mouse_down", "mouse_up"}:
             self._normalize_mouse_button(raw)
+        elif raw.kind == "mouse_move":
+            self._normalize_mouse_move(raw)
         elif raw.kind == "scroll":
             self._normalize_scroll(raw)
 
@@ -261,75 +321,157 @@ class ActionRecorder:
         if not name:
             return
         key_id = (name, scan_code)
+        decision = self._boundary_filter.authorize_keyboard()
+        if not decision.session_valid:
+            self._invalidate_target(decision.reason)
+            return
         if name in HOTKEY_BLOCKLIST:
             with self._lock:
                 self._diagnostics["ignored_hotkey_event_count"] += 1
             return
         is_down = raw.kind == "key_down"
         if is_down:
-            if not self._is_target_foreground() or key_id in self._pressed_keys:
+            if not decision.accepted or key_id in self._pressed_keys:
                 return
-            self._pressed_keys[key_id] = (name, scan_code)
-            self._record_action({"type": "key", "event": "down", "key": name, "scan_code": scan_code}, raw.timestamp)
+            self._pressed_keys[key_id] = (name, scan_code, raw.timestamp)
         elif key_id in self._pressed_keys:
-            name, scan_code = self._pressed_keys.pop(key_id)
-            self._record_action({"type": "key", "event": "up", "key": name, "scan_code": scan_code}, raw.timestamp)
+            name, scan_code, started = self._pressed_keys.pop(key_id)
+            if decision.accepted:
+                self._record_action(
+                    {
+                        "type": "key",
+                        "event": "down",
+                        "key": name,
+                        "scan_code": scan_code,
+                    },
+                    started,
+                )
+                self._record_action(
+                    {
+                        "type": "key",
+                        "event": "up",
+                        "key": name,
+                        "scan_code": scan_code,
+                    },
+                    raw.timestamp,
+                )
         with self._lock:
             self._diagnostics["open_key_count"] = len(self._pressed_keys)
 
     def _normalize_mouse_button(self, raw):
         button = raw.payload["button"]
-        point = self._to_target_ratio(raw.payload["x"], raw.payload["y"])
+        point = self._boundary_filter.authorize_mouse(
+            raw.payload["x"], raw.payload["y"]
+        )
+        if not point.session_valid:
+            self._invalidate_target(point.reason)
+            return
         if raw.kind == "mouse_down":
-            if point is None or not self._is_target_foreground():
+            if not point.accepted:
                 return
-            self._mouse_down[button] = (raw.timestamp, raw.payload["x"], raw.payload["y"], point)
+            self._mouse_down[button] = (raw.timestamp, point)
             return
         pending = self._mouse_down.pop(button, None)
         if pending is None:
             return
-        started, start_x, start_y, start_ratio = pending
-        if point is None:
+        started, start_point = pending
+        foreground = self._boundary_filter.authorize_keyboard()
+        if not foreground.session_valid:
+            self._invalidate_target(foreground.reason)
             return
-        distance = ((raw.payload["x"] - start_x) ** 2 + (raw.payload["y"] - start_y) ** 2) ** 0.5
+        if not point.accepted or not foreground.accepted:
+            return
+        distance = (
+            (point.client_x - start_point.client_x) ** 2
+            + (point.client_y - start_point.client_y) ** 2
+        ) ** 0.5
         duration_ms = max(0, int(round((raw.timestamp - started) * 1000)))
         if distance <= CLICK_DISTANCE_PX:
             action = {
                 "type": "click", "button": button,
-                "x_ratio": start_ratio[0], "y_ratio": start_ratio[1],
+                "client_x": start_point.client_x,
+                "client_y": start_point.client_y,
+                "x_ratio": start_point.x_ratio,
+                "y_ratio": start_point.y_ratio,
                 "duration_ms": duration_ms,
             }
             self._record_action(action, started, completes_at=raw.timestamp)
-            self._notify_click(action, start_x, start_y)
+            self._notify_click(action, raw.payload["x"], raw.payload["y"])
         else:
             self._record_action({
                 "type": "drag", "button": button,
-                "start_x_ratio": start_ratio[0], "start_y_ratio": start_ratio[1],
-                "end_x_ratio": point[0], "end_y_ratio": point[1],
+                "start_client_x": start_point.client_x,
+                "start_client_y": start_point.client_y,
+                "end_client_x": point.client_x,
+                "end_client_y": point.client_y,
+                "start_x_ratio": start_point.x_ratio,
+                "start_y_ratio": start_point.y_ratio,
+                "end_x_ratio": point.x_ratio,
+                "end_y_ratio": point.y_ratio,
                 "duration_ms": duration_ms,
             }, started, completes_at=raw.timestamp)
         with self._lock:
             self._diagnostics["open_mouse_button_count"] = len(self._mouse_down)
 
+    def _normalize_mouse_move(self, raw):
+        if not self._mouse_down:
+            with self._lock:
+                self._diagnostics["ignored_move_count"] += 1
+            return
+        point = self._boundary_filter.authorize_mouse(
+            raw.payload["x"], raw.payload["y"]
+        )
+        if not point.session_valid:
+            self._invalidate_target(point.reason)
+            return
+        foreground = self._boundary_filter.authorize_keyboard()
+        if not foreground.session_valid:
+            self._invalidate_target(foreground.reason)
+            return
+        if not point.accepted or not foreground.accepted:
+            self._mouse_down.clear()
+            with self._lock:
+                self._diagnostics["open_mouse_button_count"] = 0
+        with self._lock:
+            self._diagnostics["ignored_move_count"] += 1
+
     def _normalize_scroll(self, raw):
-        point = self._to_target_ratio(raw.payload["x"], raw.payload["y"])
-        if point is None or not self._is_target_foreground():
+        point = self._boundary_filter.authorize_mouse(
+            raw.payload["x"], raw.payload["y"]
+        )
+        if not point.session_valid:
+            self._invalidate_target(point.reason)
+            return
+        foreground = self._boundary_filter.authorize_keyboard()
+        if not foreground.session_valid:
+            self._invalidate_target(foreground.reason)
+            return
+        if not point.accepted or not foreground.accepted:
             return
         if self._last_scroll is not None:
             last_action, last_time, last_point = self._last_scroll
-            if raw.timestamp - last_time <= SCROLL_COALESCE_MS / 1000 and last_point == point:
+            point_key = (point.client_x, point.client_y)
+            if raw.timestamp - last_time <= SCROLL_COALESCE_MS / 1000 and last_point == point_key:
                 last_action["dx"] += raw.payload["dx"]
                 last_action["dy"] += raw.payload["dy"]
                 last_action["delta"] += raw.payload["dy"]
-                self._last_scroll = (last_action, raw.timestamp, point)
+                self._last_scroll = (last_action, raw.timestamp, point_key)
                 self._last_action_end = raw.timestamp
                 return
         action = {
-            "type": "scroll", "x_ratio": point[0], "y_ratio": point[1],
+            "type": "scroll",
+            "client_x": point.client_x,
+            "client_y": point.client_y,
+            "x_ratio": point.x_ratio,
+            "y_ratio": point.y_ratio,
             "dx": raw.payload["dx"], "dy": raw.payload["dy"], "delta": raw.payload["dy"],
         }
         self._record_action(action, raw.timestamp)
-        self._last_scroll = (action, raw.timestamp, point)
+        self._last_scroll = (
+            action,
+            raw.timestamp,
+            (point.client_x, point.client_y),
+        )
 
     def _record_action(self, action, timestamp, *, completes_at=None):
         with self._lock:
@@ -357,39 +499,49 @@ class ActionRecorder:
             except Exception:
                 self.logger.exception("[MacroRecorder] click callback failed")
 
-    def _to_target_ratio(self, screen_x, screen_y):
-        if self._target_hwnd is None:
-            return None
-        try:
-            import win32gui
-            left, top, right, bottom = win32gui.GetClientRect(self._target_hwnd)
-            client_x, client_y = win32gui.ScreenToClient(self._target_hwnd, (screen_x, screen_y))
-            width, height = right - left, bottom - top
-            if width <= 0 or height <= 0 or not (0 <= client_x < width and 0 <= client_y < height):
-                return None
-            return round(client_x / width, 4), round(client_y / height, 4)
-        except Exception:
-            return None
-
     def _is_target_foreground(self):
+        if self._boundary_filter is None:
+            return False
         try:
-            is_foreground = bool(self._target_hwnd and ctypes.windll.user32.GetForegroundWindow() == self._target_hwnd)
+            is_foreground = self._boundary_filter.authorize_keyboard().accepted
             with self._lock:
                 self._diagnostics["target_foreground"] = is_foreground
             return is_foreground
         except Exception:
             return False
 
-    def _close_open_keys(self):
-        now = time.monotonic()
-        for name, scan_code in list(self._pressed_keys.values()):
-            self._record_action({
-                "type": "key", "event": "up", "key": name,
-                "scan_code": scan_code, "synthetic": True,
-            }, now)
-        self._pressed_keys.clear()
+    def _on_target_session_event(self, event, _snapshot, _payload):
+        if event in {"TARGET_DISCONNECTED", "TARGET_SESSION_CLEARED"}:
+            self._invalidate_target("target_invalidated")
+
+    def _invalidate_target(self, reason):
         with self._lock:
+            if not self._recording or self._invalidation_notified:
+                return
+            self._accepting_events = False
+            self._stop_reason = "target_invalidated"
+            self._diagnostics["stop_reason"] = self._stop_reason
+            self._pressed_keys.clear()
+            self._mouse_down.clear()
+            self._raw_mouse_buttons.clear()
+            self._last_scroll = None
             self._diagnostics["open_key_count"] = 0
+            self._diagnostics["open_mouse_button_count"] = 0
+            self._invalidation_notified = True
+        self.logger.warning(
+            "[MacroRecorder] Target invalidated; recording stop requested reason=%s",
+            reason,
+        )
+        if callable(self.on_invalidated):
+            try:
+                self.on_invalidated("target_invalidated")
+            except Exception:
+                self.logger.exception("[MacroRecorder] invalidation callback failed")
+
+    def _unsubscribe_target_session(self):
+        if self._target_listener_registered and self.target_session is not None:
+            self.target_session.unsubscribe(self._on_target_session_event)
+            self._target_listener_registered = False
 
     def _stop_listeners(self):
         for listener_name in ("_keyboard_listener", "_mouse_listener"):

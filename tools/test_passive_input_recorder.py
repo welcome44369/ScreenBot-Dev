@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.recorder import ActionRecorder, _RawInputEvent
 from app.player import ScriptPlayer
+from tools.test_recorder_target_scope import Adapter, Session, ready_recorder, snapshot
 
 
 class _Target:
@@ -30,14 +31,7 @@ class _Key:
 
 
 def _recorder():
-    recorder = ActionRecorder(_Tracker(), settings=None)
-    recorder._target_hwnd = 42
-    recorder._start_time = 0.0
-    recorder._last_action_end = 0.0
-    recorder._recording = True
-    recorder._accepting_events = True
-    recorder._is_target_foreground = lambda: True
-    recorder._to_target_ratio = lambda x, y: (round(x / 100, 4), round(y / 100, 4))
+    recorder, _, _ = ready_recorder()
     return recorder
 
 
@@ -63,7 +57,12 @@ class PassiveInputRecorderTest(unittest.TestCase):
             patch("app.recorder.pynput_keyboard.Listener", Listener),
             patch("app.recorder.pynput_mouse.Listener", Listener),
         ):
-            recorder = ActionRecorder(_Tracker(), settings=None)
+            recorder = ActionRecorder(
+                _Tracker(),
+                settings=None,
+                target_session=Session(snapshot()),
+                boundary_adapter=Adapter(),
+            )
             recorder.start()
             recorder.stop()
             recorder.start()
@@ -71,21 +70,21 @@ class PassiveInputRecorderTest(unittest.TestCase):
         self.assertEqual(len(created), 4)
         self.assertTrue(all(listener.kwargs["suppress"] is False for listener in created))
 
-    def test_key_repeat_is_ignored_and_stop_closes_held_key(self):
+    def test_key_repeat_is_ignored_and_complete_key_is_committed(self):
         recorder = _recorder()
         key = _Key(char="w", vk=17)
         recorder._normalize(_RawInputEvent("key_down", 0.1, {"key": key}))
         recorder._normalize(_RawInputEvent("key_down", 0.2, {"key": key}))
-        self.assertEqual(len(recorder.actions), 1)
-        recorder._close_open_keys()
+        self.assertEqual(len(recorder.actions), 0)
+        recorder._normalize(_RawInputEvent("key_up", 0.3, {"key": key}))
         self.assertEqual([(event["type"], event["event"]) for event in recorder.actions], [("key", "down"), ("key", "up")])
-        self.assertTrue(recorder.actions[-1]["synthetic"])
+        self.assertFalse(any(event.get("synthetic") for event in recorder.actions))
 
     def test_hotkeys_and_free_moves_do_not_persist(self):
         recorder = _recorder()
         recorder._normalize(_RawInputEvent("key_down", 0.1, {"key": _Key(name="f8", vk=119)}))
-        recorder._on_mouse_move(1, 1)
-        recorder._on_mouse_move(2, 2)
+        recorder._normalize(_RawInputEvent("mouse_move", 0.2, {"x": 1, "y": 1}))
+        recorder._normalize(_RawInputEvent("mouse_move", 0.3, {"x": 2, "y": 2}))
         self.assertEqual(recorder.actions, [])
         self.assertEqual(recorder.get_diagnostics()["ignored_move_count"], 2)
         self.assertEqual(recorder.get_diagnostics()["ignored_hotkey_event_count"], 1)
