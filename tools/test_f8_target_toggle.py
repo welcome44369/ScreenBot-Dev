@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from app.application import ScreenBotApp
 from app.state import AppState
+from app.hotkeys import HotkeyBridge, HotkeyManager
 
 
 class _Session:
@@ -52,6 +53,28 @@ class F8TargetToggleTests(unittest.TestCase):
         # There is no deferred clear: the synchronous owner check clears only
         # the current session, so an old pending generation has no callback.
         app._handle_f8(); self.assertEqual(app.target_session.reasons, ["f8_unlock"])
+    def test_one_key_cycle_preserves_toggle_semantics(self):
+        app = self.app(bound=True)
+        bridge = HotkeyBridge()
+        manager = HotkeyManager(bridge, logging.getLogger("test.f8.cycle"))
+        class Keyboard:
+            def add_hotkey(self, key, callback, **_kwargs):
+                if key == "f8":
+                    self.down = callback
+                return "down"
+            def on_release_key(self, key, callback, suppress=False):
+                self.up = callback
+                return "up"
+            def remove_hotkey(self, _handle): pass
+            def unhook(self, _handle): pass
+        manager.keyboard, manager._available = Keyboard(), True
+        bridge.f8_pressed.connect(app._handle_f8)
+        manager.register_hotkeys()
+        manager.keyboard.down(); manager.keyboard.down()
+        self.assertFalse(app.target_session.has_target())
+        self.assertEqual(app.lock_calls, 0)
+        manager.keyboard.up(None); manager.keyboard.down()
+        self.assertEqual(app.lock_calls, 1)
 
 
 if __name__ == "__main__": unittest.main(verbosity=2)
