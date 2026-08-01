@@ -363,15 +363,45 @@ class ScreenBotApp:
         self._refresh_compact_presentation()
 
     def _handle_f8(self):
-        """Lock or refresh the target only; F8 must never start execution."""
-        self.logger.info("F8 熱鍵觸發：僅鎖定／更新目標視窗")
-        if self.workflow_runner.is_active():
-            # Changing the target during an active run would break the locked
-            # target contract.  Crucially, this branch still performs no
-            # countdown, player start, workflow start, or run-log creation.
-            self.logger.info("Workflow 執行中，忽略 F8 目標更新")
+        """Toggle only the frozen TargetSession; never retarget on unlock."""
+        target_session = getattr(self, "target_session", None)
+        if target_session is not None and target_session.has_target():
+            self.logger.info("F8_TARGET_UNLOCK_REQUEST")
+            self._f8_stop_then_unlock()
             return
+        self.logger.info("F8_TARGET_LOCK_REQUEST")
         self.lock_or_refresh_target_only()
+
+    def _f8_stop_then_unlock(self):
+        """Clear only after existing synchronous stop owners report idle."""
+        workflow = getattr(self, "workflow_runner", None)
+        if workflow is not None and workflow.is_active():
+            stopper = getattr(self, "stop_workflow", None)
+            if not callable(stopper):
+                self.logger.warning("F8_TARGET_UNLOCK_BLOCKED owner=workflow_no_stop_owner")
+                return False
+            stopper()
+            if workflow.is_active():
+                self.logger.warning("F8_TARGET_UNLOCK_BLOCKED owner=workflow")
+                return False
+        if getattr(self, "state", None) in {AppState.RUNNING, AppState.PAUSED}:
+            self.stop_script()
+            if getattr(self, "player", None) is not None and self.player.is_active():
+                self.logger.warning("F8_TARGET_UNLOCK_BLOCKED owner=script")
+                return False
+        if getattr(self, "state", None) is AppState.RECORDING:
+            self.stop_recording()
+            recorder = getattr(self, "recorder", None)
+            if recorder is not None and recorder.is_recording():
+                self.logger.warning("F8_TARGET_UNLOCK_BLOCKED owner=recorder")
+                return False
+        target_session = getattr(self, "target_session", None)
+        if target_session is None or not target_session.has_target():
+            return False
+        target_session.clear("f8_unlock")
+        self._refresh_compact_presentation()
+        self.logger.info("F8_TARGET_UNLOCKED")
+        return True
 
     def lock_or_refresh_target_only(self):
         """Refresh the explicit target lock without changing runtime state."""
@@ -413,6 +443,8 @@ class ScreenBotApp:
             )
             return info
         except Exception as exc:
+            if "ScreenBot window" in str(exc):
+                self.logger.info("F8_SELF_TARGET_REJECTED")
             self._record_overlay_diagnostic(
                 "TARGET_LOCK_FAILED", exception_type=type(exc).__name__, message=str(exc)
             )

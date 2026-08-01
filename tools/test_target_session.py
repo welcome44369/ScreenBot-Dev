@@ -293,6 +293,10 @@ class TargetSessionTests(unittest.TestCase):
             {"is_active": lambda _self: True},
         )()
         app.window_tracker = tracker
+        app.target_session = service
+        # The isolated stub intentionally has no completion-capable owner;
+        # F8 must keep the frozen session rather than attempting a retarget.
+        app.stop_workflow = lambda: None
         app._handle_f8()
 
         current = service.get_snapshot()

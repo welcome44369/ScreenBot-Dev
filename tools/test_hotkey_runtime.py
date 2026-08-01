@@ -6,7 +6,7 @@ from app.state import AppState
 
 class _Keyboard:
     def __init__(self, fail=False): self.fail, self.added, self.removed = fail, [], []
-    def add_hotkey(self, key, callback):
+    def add_hotkey(self, key, callback, **_kwargs):
         if self.fail and key == "f8": raise RuntimeError("denied")
         self.added.append((key, callback)); return key
     def remove_hotkey(self, handle): self.removed.append(handle)

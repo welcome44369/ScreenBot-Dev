@@ -40,7 +40,9 @@ class HotkeyManager:
             return False
         try:
             self.logger.info("HOTKEY_REGISTER_ATTEMPT key=F8")
-            f8 = self.keyboard.add_hotkey("f8", lambda: self.bridge.f8_pressed.emit())
+            # Release-edge registration prevents OS auto-repeat from creating
+            # more than one TargetSession transition for one held key.
+            f8 = self.keyboard.add_hotkey("f8", lambda: self.bridge.f8_pressed.emit(), trigger_on_release=True)
         except Exception as exc:
             self.logger.error("HOTKEY_REGISTRATION_FAILED key=F8 error_type=%s message=%s", type(exc).__name__, exc)
             self._status("HOTKEY_REGISTRATION_FAILED", key="F8", error_type=type(exc).__name__, message=str(exc))
