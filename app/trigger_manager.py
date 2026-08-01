@@ -60,7 +60,7 @@ class TriggerManager(ManagerWindowBase):
         self.list_widget = QListWidget()
         root.addWidget(self.list_widget)
         buttons = QHBoxLayout()
-        for label, callback in (("新增", self._new), ("編輯", self._edit), ("刪除", self._delete), ("重新整理", self.refresh)):
+        for label, callback in (("新增", self._new), ("新增系統觸發點", self._new_workflow_start), ("編輯", self._edit), ("刪除", self._delete), ("重新整理", self.refresh)):
             button = QPushButton(label)
             button.clicked.connect(callback)
             buttons.addWidget(button)
@@ -74,34 +74,34 @@ class TriggerManager(ManagerWindowBase):
             self.list_widget.item(self.list_widget.count() - 1).setData(32, item["id"])
 
     def _new(self):
-        trigger_type, ok = QInputDialog.getItem(
-            self, "New Trigger", "Type:", ["Workflow Start", "Text (OCR)"], 0, False
-        )
-        if not ok:
-            return
-        if trigger_type == "Workflow Start":
-            dialog = WorkflowStartTriggerDialog(self.store, parent=self)
-            dialog.finished.connect(lambda _result: self.refresh())
-            dialog.exec()
-            return
+        self._open_ocr_wizard()
+
+    def _new_workflow_start(self):
+        dialog = WorkflowStartTriggerDialog(self.store, parent=self)
+        dialog.finished.connect(lambda _result: self.refresh())
+        dialog.exec()
+
+    def _open_ocr_wizard(self, data=None):
         if self.window_tracker is not None and self.text_detector is not None:
-            wizard = TriggerWizard(self.store, self.window_tracker, self.text_detector, self)
-            if callable(self.on_select_start): self.on_select_start()
+            wizard = TriggerWizard(self.store, self.window_tracker, self.text_detector, self, data=data)
+            if callable(self.on_select_start):
+                self.on_select_start()
             wizard.setWindowModality(Qt.WindowModality.NonModal)
             wizard.finished.connect(lambda result: (self.refresh(), self.on_select_end() if callable(self.on_select_end) else None))
             wizard.show(); wizard.raise_(); wizard.activateWindow()
-            return
+            return wizard
         name, ok = QInputDialog.getText(self, "新增 Trigger", "名稱:")
         if not ok or not name.strip():
-            return
+            return None
         text, ok = QInputDialog.getText(self, "新增 Trigger", "偵測文字:")
         if not ok or not text.strip():
-            return
+            return None
         try:
             self.store.save_trigger({"version": 1, "name": name.strip(), "type": "text", "event": "appear", "text": text, "region": {"x_ratio": 0.0, "y_ratio": 0.0, "width_ratio": 1.0, "height_ratio": 1.0}})
             self.refresh()
         except Exception as exc:
             show_warning(self, "Trigger 儲存失敗", str(exc))
+        return None
 
     def _edit(self):
         item = self.list_widget.currentItem()
@@ -114,7 +114,10 @@ class TriggerManager(ManagerWindowBase):
             dialog.finished.connect(lambda _result: self.refresh())
             dialog.exec()
             return
-        text, ok = QInputDialog.getText(self, "編輯 Trigger", "偵測文字:", text=data["text"])
+        if self.window_tracker is not None and self.text_detector is not None:
+            self._open_ocr_wizard(data=data)
+            return
+        text, ok = QInputDialog.getText(self, "編輯 Trigger", "偵測文字:", text=data.get("text", ""))
         if ok and text.strip():
             data["text"] = text.strip()
             try:

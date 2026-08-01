@@ -27,12 +27,22 @@ from app.dialog_utils import show_warning
 from app.ocr_correction_store import OCRCorrectionStore
 from app.ocr_region_selector import OCRRegionSelectorDialog, pil_image_to_qpixmap
 from app.selection_session import SelectionSession
+from app.trigger_conditions import (
+    LEGACY_APPEAR,
+    LEGACY_DISAPPEAR,
+    add_condition_items,
+    apply_condition_to_payload,
+    condition_code,
+    condition_from_code,
+    ui_code_from_trigger,
+)
+from app.trigger_store import DEFAULT_REGION
 
 
 class TriggerWizard(QDialog):
-    """Create a Trigger from OCR candidates; candidates cannot be invented."""
+    """Create or edit a Trigger from OCR candidates; candidates cannot be invented."""
 
-    def __init__(self, trigger_store, window_tracker, text_detector, parent=None):
+    def __init__(self, trigger_store, window_tracker, text_detector, parent=None, data=None):
         super().__init__(parent)
         self.store = trigger_store
         self.tracker = window_tracker
@@ -42,18 +52,20 @@ class TriggerWizard(QDialog):
 
         self.setWindowTitle("新增 OCR 偵測觸發點")
         self.resize(460, 420)
-        self.region = None
+        self.region = dict(DEFAULT_REGION)
         self.ocr_text = ""
         self._screenshot = None
         self._last_crop = None
         self._last_pipeline_result = None
         self._selector = None
         self._selection_session = None
+        self._editing_trigger_id = None
+        self._editing_trigger_data = None
 
         form = QFormLayout(self)
         self.name_edit = QLineEdit()
         self.event = QComboBox()
-        self.event.addItems(["appear", "disappear"])
+        self._initialize_event_combo()
         self.raw_ocr = QPlainTextEdit()
         self.raw_ocr.setReadOnly(True)
         self.raw_ocr.setMaximumHeight(90)
@@ -96,6 +108,9 @@ class TriggerWizard(QDialog):
         save.clicked.connect(self.save)
         cancel.clicked.connect(self.reject)
 
+        if data is not None:
+            self._populate_from_data(data)
+
     @staticmethod
     def _normalized(value):
         return re.sub(r"\s+", "", (value or "").strip()).casefold()
@@ -106,6 +121,70 @@ class TriggerWizard(QDialog):
             "text": item.text(),
             "original_text": item.text(),
         }
+
+    def _initialize_event_combo(self):
+        add_condition_items(self.event)
+        if self.event.count() > 0:
+            self.event.setCurrentIndex(0)
+
+    def _set_condition_code(self, code):
+        if not code:
+            return
+        for index in range(self.event.count()):
+            if self.event.itemData(index) == code:
+                self.event.setCurrentIndex(index)
+                return
+
+    def _condition_code_for_trigger(self, data):
+        if not isinstance(data, dict):
+            return None
+        condition = data.get("condition")
+        code = condition_code(condition)
+        if code:
+            return code
+        ui_code = ui_code_from_trigger(data)
+        if ui_code == LEGACY_APPEAR:
+            return "edge_present"
+        if ui_code == LEGACY_DISAPPEAR:
+            return "edge_absent"
+        return None
+
+    def _populate_from_data(self, data):
+        if not isinstance(data, dict):
+            return
+        self._editing_trigger_id = data.get("id")
+        self._editing_trigger_data = dict(data)
+        self.name_edit.setText(str(data.get("name", "")))
+        self._set_condition_code(self._condition_code_for_trigger(data))
+        self.poll.setValue(int(data.get("poll_interval_ms", 500)))
+        self.confirm.setValue(int(data.get("confirm_frames", 2)))
+        self.cooldown.setValue(int(data.get("cooldown_ms", 0)))
+        texts = data.get("texts") or [data.get("text", "")]
+        if not isinstance(texts, list):
+            texts = [str(texts)]
+        self.candidates.clear()
+        for text in texts:
+            if not isinstance(text, str) or not text.strip():
+                continue
+            self._add_candidate(
+                {
+                    "source": "existing",
+                    "text": text.strip(),
+                    "original_text": text.strip(),
+                },
+                checked=True,
+            )
+        region = data.get("region") or DEFAULT_REGION
+        if isinstance(region, dict):
+            self.region = {
+                "x_ratio": float(region.get("x_ratio", DEFAULT_REGION["x_ratio"])),
+                "y_ratio": float(region.get("y_ratio", DEFAULT_REGION["y_ratio"])),
+                "width_ratio": float(region.get("width_ratio", DEFAULT_REGION["width_ratio"])),
+                "height_ratio": float(region.get("height_ratio", DEFAULT_REGION["height_ratio"])),
+            }
+        else:
+            self.region = dict(DEFAULT_REGION)
+        self.status.setText("已載入現有觸發點設定")
 
     def _add_candidate(self, metadata, checked=False):
         text = metadata["text"].strip()
@@ -311,20 +390,24 @@ class TriggerWizard(QDialog):
             show_warning(self, "資料不足", "請完成名稱、Region 並至少選擇一個 OCR 文字。")
             return
         try:
-            trigger_id = self.store.save_trigger(
-                {
-                    "version": 1,
-                    "name": self.name_edit.text().strip(),
-                    "type": "text",
-                    "event": self.event.currentText(),
-                    "texts": selected,
-                    "match_mode": "any",
-                    "region": self.region,
-                    "poll_interval_ms": self.poll.value(),
-                    "confirm_frames": self.confirm.value(),
-                    "cooldown_ms": self.cooldown.value(),
-                }
-            )
+            selected_code = self.event.currentData() or "initial_absent"
+            payload = {
+                "version": 1,
+                "name": self.name_edit.text().strip(),
+                "type": "text",
+                "texts": selected,
+                "match_mode": "any",
+                "region": self.region,
+                "poll_interval_ms": self.poll.value(),
+                "confirm_frames": self.confirm.value(),
+                "cooldown_ms": self.cooldown.value(),
+            }
+            payload = apply_condition_to_payload(payload, selected_code)
+            payload["event"] = "appear" if selected_code.endswith("_present") else "disappear"
+            if self._editing_trigger_id is None:
+                trigger_id = self.store.save_trigger(payload)
+            else:
+                trigger_id = self.store.update_trigger(self._editing_trigger_id, payload)
             if self._last_crop is not None and self._last_pipeline_result is not None:
                 self.correction_store.record(
                     crop_image=self._last_crop,
