@@ -45,6 +45,7 @@ class WorkflowEditor(QWidget):
         window_tracker=None,
         text_detector=None,
         is_workflow_running=None,
+        trigger_store=None,
     ):
         """
         Args:
@@ -53,6 +54,7 @@ class WorkflowEditor(QWidget):
             get_running_filename: Callable() → str|None; returns filename of
                                   the currently running workflow, if any.
             logger: Optional logger.
+            trigger_store: TriggerStore instance for stop-condition selection.
         """
         super().__init__(None, Qt.Window)
         self.setWindowTitle("Workflow Editor")
@@ -61,6 +63,7 @@ class WorkflowEditor(QWidget):
 
         self.workflow_store = workflow_store
         self.script_store = script_store
+        self.trigger_store = trigger_store
         self.get_running_filename = get_running_filename or (lambda: None)
         self.logger = logger or logging.getLogger("ScreenBot")
         self.window_tracker = window_tracker
@@ -73,10 +76,8 @@ class WorkflowEditor(QWidget):
         self._current_step_index = -1
         self._ignoring_form = False  # suppress _mark_dirty during programmatic field updates
         self._current_region = dict(DEFAULT_REGION)
-        self._stop_region = dict(DEFAULT_REGION)
         self._preview_thread = None
         self._preview_worker = None
-        self._preview_region_source = "step"
 
         self._setup_ui()
         self._refresh_macro_list()
@@ -115,9 +116,9 @@ class WorkflowEditor(QWidget):
         loop_form = QFormLayout(loop_group)
         self.loop_enable_chk = QCheckBox("Enable Loop")
         self.loop_mode_combo = QComboBox()
-        self.loop_mode_combo.addItem("Until Manually Stopped", "manual_stop")
-        self.loop_mode_combo.addItem("Run N Cycles", "max_cycles")
-        self.loop_mode_combo.addItem("Until Stop Condition", "stop_trigger")
+        self.loop_mode_combo.addItem("直到手動停止", "manual_stop")
+        self.loop_mode_combo.addItem("指定執行循環次數", "max_cycles")
+        self.loop_mode_combo.addItem("直到停止條件成立", "stop_trigger")
         self.loop_restart_combo = QComboBox()
         self.loop_max_cycles = QSpinBox()
         self.loop_max_cycles.setRange(1, 1000000)
@@ -127,49 +128,20 @@ class WorkflowEditor(QWidget):
         loop_form.addRow("Restart Step:", self.loop_restart_combo)
         loop_form.addRow("Maximum Cycles:", self.loop_max_cycles)
 
-        self.stop_group = QGroupBox("Stop Condition (Global Stop Trigger)")
+        self.stop_group = QGroupBox("停止條件")
         stop_form = QFormLayout(self.stop_group)
-        self.stop_type_label = QLabel("text")
-        self.stop_event_combo = QComboBox()
-        self.stop_event_combo.addItem("appear", "appear")
-        self.stop_event_combo.addItem("disappear", "disappear")
-        self.stop_text_edit = QLineEdit()
-        self.stop_text_edit.setPlaceholderText("Stop condition text...")
-        self.stop_poll = QSpinBox()
-        self.stop_poll.setRange(100, 10000)
-        self.stop_poll.setSingleStep(100)
-        self.stop_poll.setValue(500)
-        self.stop_confirm = QSpinBox()
-        self.stop_confirm.setRange(1, 100)
-        self.stop_confirm.setValue(3)
-        self.stop_cooldown = QSpinBox()
-        self.stop_cooldown.setRange(0, 60000)
-        self.stop_cooldown.setSingleStep(100)
-        self.stop_cooldown.setValue(0)
-        self.stop_region_x = QLineEdit()
-        self.stop_region_y = QLineEdit()
-        self.stop_region_w = QLineEdit()
-        self.stop_region_h = QLineEdit()
-        for fld in (self.stop_region_x, self.stop_region_y, self.stop_region_w, self.stop_region_h):
-            fld.setReadOnly(True)
-        stop_btn_row = QHBoxLayout()
-        self.btn_select_stop_region = QPushButton("Select Stop Region")
-        self.btn_full_stop_region = QPushButton("Full Window")
-        self.btn_preview_stop_ocr = QPushButton("Preview Stop OCR")
-        stop_btn_row.addWidget(self.btn_select_stop_region)
-        stop_btn_row.addWidget(self.btn_full_stop_region)
-        stop_btn_row.addWidget(self.btn_preview_stop_ocr)
-        stop_form.addRow("Stop Trigger Type:", self.stop_type_label)
-        stop_form.addRow("Event:", self.stop_event_combo)
-        stop_form.addRow("Text:", self.stop_text_edit)
-        stop_form.addRow("Poll Interval (ms):", self.stop_poll)
-        stop_form.addRow("Confirm Frames:", self.stop_confirm)
-        stop_form.addRow("Cooldown (ms):", self.stop_cooldown)
-        stop_form.addRow("Region X:", self.stop_region_x)
-        stop_form.addRow("Region Y:", self.stop_region_y)
-        stop_form.addRow("Region Width:", self.stop_region_w)
-        stop_form.addRow("Region Height:", self.stop_region_h)
-        stop_form.addRow(stop_btn_row)
+        stop_hint = QLabel("僅偵測目前鎖定的目標視窗")
+        stop_hint.setStyleSheet("font-size: 11px; color: #555;")
+        self.stop_ref_combo = QComboBox()
+        self.stop_ref_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.stop_ref_combo.addItem("（請選擇停止條件）", None)
+        self.btn_refresh_stop = QPushButton("重新整理")
+        self.btn_refresh_stop.setFixedHeight(24)
+        stop_ref_row = QHBoxLayout()
+        stop_ref_row.addWidget(self.stop_ref_combo, 1)
+        stop_ref_row.addWidget(self.btn_refresh_stop)
+        stop_form.addRow(stop_hint)
+        stop_form.addRow("Trigger:", stop_ref_row)
 
         root.addWidget(loop_group)
         root.addWidget(self.stop_group)
@@ -355,9 +327,7 @@ class WorkflowEditor(QWidget):
         self.btn_select_region.clicked.connect(self._on_select_region)
         self.btn_full_region.clicked.connect(self._on_set_full_window_region)
         self.btn_preview_ocr.clicked.connect(self._on_preview_ocr)
-        self.btn_select_stop_region.clicked.connect(self._on_select_stop_region)
-        self.btn_full_stop_region.clicked.connect(self._on_set_full_window_stop_region)
-        self.btn_preview_stop_ocr.clicked.connect(self._on_preview_stop_ocr)
+        self.btn_refresh_stop.clicked.connect(self._refresh_stop_triggers)
         self.btn_copy_ocr_text.clicked.connect(self._copy_preview_text)
         self.btn_copy_region.clicked.connect(self._copy_region_text)
         self.step_list.currentRowChanged.connect(self._on_step_row_changed)
@@ -373,14 +343,12 @@ class WorkflowEditor(QWidget):
         self.loop_mode_combo.currentIndexChanged.connect(self._on_loop_controls_changed)
         self.loop_restart_combo.currentIndexChanged.connect(self._mark_dirty)
         self.loop_max_cycles.valueChanged.connect(self._mark_dirty)
-        self.stop_event_combo.currentIndexChanged.connect(self._mark_dirty)
-        self.stop_text_edit.textChanged.connect(self._mark_dirty)
-        self.stop_poll.valueChanged.connect(self._mark_dirty)
-        self.stop_confirm.valueChanged.connect(self._mark_dirty)
-        self.stop_cooldown.valueChanged.connect(self._mark_dirty)
+        self.stop_ref_combo.currentIndexChanged.connect(self._mark_dirty)
 
         self._set_form_enabled(False)
         self._refresh_restart_step_options()
+        self._refresh_stop_triggers()
+        self._update_loop_visibility()
         self._ignoring_form = True
         self._on_loop_controls_changed()
         self._ignoring_form = False
@@ -417,7 +385,11 @@ class WorkflowEditor(QWidget):
         self.loop_max_cycles.setEnabled(
             enabled and self.loop_enable_chk.isChecked() and self.loop_mode_combo.currentData() == "max_cycles"
         )
-        self.stop_group.setEnabled(enabled and self._is_stop_trigger_mode())
+        self._update_loop_visibility()
+
+    def _update_loop_visibility(self):
+        """Show the stop-condition group only when in stop_trigger mode."""
+        self.stop_group.setVisible(self._is_stop_trigger_mode())
 
     def _set_fields_readonly(self, readonly):
         """Used for unsupported trigger steps — show data but block editing."""
@@ -452,6 +424,27 @@ class WorkflowEditor(QWidget):
             idx = self.fld_macro.findData(current)
             if idx >= 0:
                 self.fld_macro.setCurrentIndex(idx)
+        self._ignoring_form = False
+
+    def _refresh_stop_triggers(self):
+        """Reload the stop condition trigger list from TriggerStore (OCR text triggers only)."""
+        if self.trigger_store is None:
+            return
+        current = self.stop_ref_combo.currentData()
+        self._ignoring_form = True
+        self.stop_ref_combo.clear()
+        self.stop_ref_combo.addItem("（請選擇停止條件）", None)
+        for item in self.trigger_store.list_triggers():
+            try:
+                trigger = self.trigger_store.load_trigger(item["id"])
+                if trigger.get("type", "text") == "text":
+                    self.stop_ref_combo.addItem(item["name"], item["id"])
+            except Exception:
+                pass
+        if current:
+            idx = self.stop_ref_combo.findData(current)
+            if idx >= 0:
+                self.stop_ref_combo.setCurrentIndex(idx)
         self._ignoring_form = False
 
     @staticmethod
@@ -493,15 +486,6 @@ class WorkflowEditor(QWidget):
         self.region_y.setText(f"{self._current_region['y_ratio']:.6f}")
         self.region_w.setText(f"{self._current_region['width_ratio']:.6f}")
         self.region_h.setText(f"{self._current_region['height_ratio']:.6f}")
-        if mark_dirty:
-            self._mark_dirty()
-
-    def _set_stop_region(self, region, mark_dirty=True):
-        self._stop_region = self._normalize_region(region)
-        self.stop_region_x.setText(f"{self._stop_region['x_ratio']:.6f}")
-        self.stop_region_y.setText(f"{self._stop_region['y_ratio']:.6f}")
-        self.stop_region_w.setText(f"{self._stop_region['width_ratio']:.6f}")
-        self.stop_region_h.setText(f"{self._stop_region['height_ratio']:.6f}")
         if mark_dirty:
             self._mark_dirty()
 
@@ -666,26 +650,29 @@ class WorkflowEditor(QWidget):
 
     def _load_loop_settings(self):
         loop = (self._draft or {}).get("loop") or {}
-        mode = loop.get("mode", "manual_stop")
+        mode = loop.get("mode")
         restart_step = loop.get("restart_step")
         max_cycles = loop.get("max_cycles", 1)
-        stop_trigger = loop.get("stop_trigger") or {}
+        stop_trigger_ref = loop.get("stop_trigger_ref")
+        # If no explicit mode but a stop_trigger_ref is present (legacy one-shot
+        # with stop pattern), treat as stop_trigger mode in the editor.
+        if mode is None and stop_trigger_ref:
+            mode = "stop_trigger"
+        elif mode is None:
+            mode = "manual_stop"
         self._ignoring_form = True
         self.loop_enable_chk.setChecked(bool(loop))
         mode_idx = self.loop_mode_combo.findData(mode)
         self.loop_mode_combo.setCurrentIndex(max(0, mode_idx))
         self.loop_max_cycles.setValue(max(1, self._int_or_default(max_cycles, 1)))
         self._refresh_restart_step_options(selected=restart_step)
-        self.stop_event_combo.setCurrentIndex(max(0, self.stop_event_combo.findData(stop_trigger.get("event", "appear"))))
-        self.stop_text_edit.setText(str(stop_trigger.get("text", "")))
-        self.stop_poll.setValue(max(100, self._int_or_default(stop_trigger.get("poll_interval_ms", 500), 500)))
-        self.stop_confirm.setValue(max(1, self._int_or_default(stop_trigger.get("confirm_frames", 3), 3)))
-        self.stop_cooldown.setValue(max(0, self._int_or_default(stop_trigger.get("cooldown_ms", 0), 0)))
-        self._set_stop_region(stop_trigger.get("region", DEFAULT_REGION), mark_dirty=False)
+        if stop_trigger_ref:
+            idx = self.stop_ref_combo.findData(stop_trigger_ref)
+            self.stop_ref_combo.setCurrentIndex(max(0, idx))
+        else:
+            self.stop_ref_combo.setCurrentIndex(0)
         self._ignoring_form = False
-        self._ignoring_form = True
-        self._on_loop_controls_changed()
-        self._ignoring_form = False
+        self._update_loop_visibility()
 
     def _refresh_restart_step_options(self, selected=None, old_step_id=None, new_step_id=None):
         steps = (self._draft or {}).get("steps", [])
@@ -714,7 +701,7 @@ class WorkflowEditor(QWidget):
     def _is_stop_trigger_mode(self):
         return self.loop_enable_chk.isChecked() and self.loop_mode_combo.currentData() == "stop_trigger"
 
-    def _on_loop_controls_changed(self):
+    def _on_loop_controls_changed(self, *_):
         if self._ignoring_form:
             return
         self.loop_mode_combo.setEnabled(self.loop_enable_chk.isChecked())
@@ -722,7 +709,7 @@ class WorkflowEditor(QWidget):
         self.loop_max_cycles.setEnabled(
             self.loop_enable_chk.isChecked() and self.loop_mode_combo.currentData() == "max_cycles"
         )
-        self.stop_group.setEnabled(self._is_stop_trigger_mode())
+        self._update_loop_visibility()
         self._mark_dirty()
 
     def _commit_loop_settings(self):
@@ -740,15 +727,9 @@ class WorkflowEditor(QWidget):
         if mode == "max_cycles":
             loop["max_cycles"] = self.loop_max_cycles.value()
         if mode == "stop_trigger":
-            loop["stop_trigger"] = {
-                "type": "text",
-                "event": self.stop_event_combo.currentData() or "appear",
-                "text": self.stop_text_edit.text().strip(),
-                "region": self._normalize_region(self._stop_region),
-                "poll_interval_ms": self.stop_poll.value(),
-                "confirm_frames": self.stop_confirm.value(),
-                "cooldown_ms": self.stop_cooldown.value(),
-            }
+            ref = self.stop_ref_combo.currentData()
+            if ref:
+                loop["stop_trigger_ref"] = ref
         self._draft["loop"] = loop
 
     def _on_add_step(self):
@@ -866,21 +847,12 @@ class WorkflowEditor(QWidget):
         self._set_region(DEFAULT_REGION, mark_dirty=True)
         self._set_status("Region set to full window.")
 
-    def _on_set_full_window_stop_region(self):
-        self._set_stop_region(DEFAULT_REGION, mark_dirty=True)
-        self._set_status("Stop region set to full window.")
-
     def _on_select_region(self):
         if not self._current_step_supported_text_trigger():
             return
-        self._select_region_for("step")
+        self._select_region_for()
 
-    def _on_select_stop_region(self):
-        if not self._is_stop_trigger_mode():
-            return
-        self._select_region_for("stop")
-
-    def _select_region_for(self, region_source):
+    def _select_region_for(self):
         if self.text_detector is None:
             QMessageBox.warning(self, "OCR unavailable", "TextDetector is not available.")
             return
@@ -898,10 +870,7 @@ class WorkflowEditor(QWidget):
             if rect["width"] < 20 or rect["height"] < 12:
                 QMessageBox.warning(self, "Region too small", "The selected OCR region is too small.")
                 return
-            if region_source == "stop":
-                self._set_stop_region(region, mark_dirty=True)
-            else:
-                self._set_region(region, mark_dirty=True)
+            self._set_region(region, mark_dirty=True)
             self._set_status(
                 f"Region selected: {rect['width']}x{rect['height']} px "
                 f"({region['x_ratio']:.4f}, {region['y_ratio']:.4f}, {region['width_ratio']:.4f}, {region['height_ratio']:.4f})"
@@ -913,9 +882,6 @@ class WorkflowEditor(QWidget):
         self.btn_preview_ocr.setEnabled(not busy and self._current_step_supported_text_trigger())
         self.btn_select_region.setEnabled(not busy and self._current_step_supported_text_trigger())
         self.btn_full_region.setEnabled(not busy and self._current_step_supported_text_trigger())
-        self.btn_preview_stop_ocr.setEnabled(not busy and self._is_stop_trigger_mode())
-        self.btn_select_stop_region.setEnabled(not busy and self._is_stop_trigger_mode())
-        self.btn_full_stop_region.setEnabled(not busy and self._is_stop_trigger_mode())
         if busy:
             self.preview_status.setText("Status: Processing...")
 
@@ -933,14 +899,9 @@ class WorkflowEditor(QWidget):
     def _on_preview_ocr(self):
         if not self._current_step_supported_text_trigger():
             return
-        self._start_preview_for_region("step")
+        self._start_preview_for_region()
 
-    def _on_preview_stop_ocr(self):
-        if not self._is_stop_trigger_mode():
-            return
-        self._start_preview_for_region("stop")
-
-    def _start_preview_for_region(self, region_source):
+    def _start_preview_for_region(self):
         if self._preview_thread is not None:
             return
         if self.is_workflow_running():
@@ -959,11 +920,7 @@ class WorkflowEditor(QWidget):
             QMessageBox.warning(self, "Preview unavailable", str(exc))
             return
 
-        if region_source == "stop":
-            region = self._normalize_region(self._stop_region)
-        else:
-            region = self._normalize_region(self._current_region)
-        self._preview_region_source = region_source
+        region = self._normalize_region(self._current_region)
         self._set_preview_busy(True)
         self._update_preview_foreground_warning()
 
@@ -1216,35 +1173,9 @@ class WorkflowEditor(QWidget):
                 if not isinstance(max_cycles, int) or max_cycles < 1:
                     return "Loop max cycles must be an integer >= 1."
             if mode == "stop_trigger":
-                stop_trigger = loop.get("stop_trigger")
-                if not isinstance(stop_trigger, dict):
-                    return "Loop stop trigger is missing."
-                if stop_trigger.get("type") != "text":
-                    return "Stop trigger type must be 'text'."
-                event = stop_trigger.get("event")
-                if event not in ("appear", "disappear"):
-                    return "Stop trigger event must be 'appear' or 'disappear'."
-                if not (stop_trigger.get("text") or "").strip():
-                    return "Stop trigger text cannot be empty."
-                poll = stop_trigger.get("poll_interval_ms")
-                if not isinstance(poll, int) or poll < 100:
-                    return "Stop trigger poll interval must be an integer >= 100 ms."
-                confirm = stop_trigger.get("confirm_frames")
-                if not isinstance(confirm, int) or confirm < 1:
-                    return "Stop trigger confirm frames must be an integer >= 1."
-                cooldown = stop_trigger.get("cooldown_ms")
-                if not isinstance(cooldown, int) or cooldown < 0:
-                    return "Stop trigger cooldown must be an integer >= 0 ms."
-                region = stop_trigger.get("region")
-                if not isinstance(region, dict):
-                    return "Stop trigger region is missing."
-                for key in ("x_ratio", "y_ratio", "width_ratio", "height_ratio"):
-                    value = region.get(key)
-                    if not isinstance(value, (int, float)):
-                        return f"Stop trigger region '{key}' must be numeric."
-                norm = self._normalize_region(region)
-                if norm["width_ratio"] <= 0 or norm["height_ratio"] <= 0:
-                    return "Stop trigger region width/height must be > 0."
+                stop_ref = loop.get("stop_trigger_ref")
+                if not isinstance(stop_ref, str) or not stop_ref.strip():
+                    return "請選擇停止條件。"
         return None
 
     # ─── Discard guard ───────────────────────────────────────────────────────

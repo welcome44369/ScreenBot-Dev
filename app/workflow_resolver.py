@@ -17,7 +17,24 @@ class WorkflowResolver:
         for step in steps:
             if step.get("trigger_ref"):
                 trigger = self.trigger_store.load_trigger(step["trigger_ref"])
-                step["trigger"] = {key: trigger[key] for key in ("type", "event", "text", "texts", "region", "poll_interval_ms", "confirm_frames", "cooldown_ms", "min_absent_duration_ms", "observation") if key in trigger}
+                resolved_trigger = {
+                    key: trigger[key]
+                    for key in (
+                        "type",
+                        "event",
+                        "condition",
+                        "text",
+                        "texts",
+                        "region",
+                        "poll_interval_ms",
+                        "confirm_frames",
+                        "cooldown_ms",
+                        "min_absent_duration_ms",
+                        "observation",
+                    )
+                    if key in trigger
+                }
+                step["trigger"] = resolved_trigger
             elif not isinstance(step.get("trigger"), dict):
                 raise ValueError(f"Step {step.get('id', '(unknown)')} is missing trigger or trigger_ref")
             if step.get("macro_ref"):
@@ -31,5 +48,23 @@ class WorkflowResolver:
         loop = resolved.get("loop")
         if isinstance(loop, dict) and loop.get("stop_trigger_ref"):
             trigger = self.trigger_store.load_trigger(loop["stop_trigger_ref"])
-            loop["stop_trigger"] = {key: trigger[key] for key in ("type", "event", "text", "texts", "region", "poll_interval_ms", "confirm_frames", "cooldown_ms", "min_absent_duration_ms", "observation") if key in trigger}
+            loop["stop_trigger"] = {
+                key: trigger[key]
+                for key in (
+                    "id",
+                    "name",
+                    "type",
+                    "event",
+                    "condition",
+                    "text",
+                    "texts",
+                    "region",
+                    "poll_interval_ms",
+                    "confirm_frames",
+                    "cooldown_ms",
+                    "min_absent_duration_ms",
+                    "observation",
+                )
+                if key in trigger
+            }
         return resolved

@@ -27,7 +27,25 @@ class WorkflowStore:
         if not path.exists():
             raise FileNotFoundError(path)
         data = self._load_json(path)
+        data = self._migrate_legacy_loop(data)
         self._validate_workflow(data, filename)
+        return data
+
+    @staticmethod
+    def _migrate_legacy_loop(data):
+        """Remap legacy loop modes to current canonical representations."""
+        loop = data.get("loop")
+        if not isinstance(loop, dict):
+            return data
+        mode = loop.get("mode")
+        if mode in ("once", "執行一次"):
+            migrated = dict(data)
+            migrated["loop"] = {
+                **loop,
+                "mode": "max_cycles",
+                "max_cycles": loop.get("max_cycles") if isinstance(loop.get("max_cycles"), int) else 1,
+            }
+            return migrated
         return data
 
     def _load_json(self, path):
@@ -88,6 +106,12 @@ class WorkflowStore:
         if not isinstance(loop, dict):
             raise ValueError(f"{filename}: loop must be an object")
         mode = loop.get("mode")
+        # A loop with only stop_trigger_ref and no mode is a valid legacy
+        # one-shot-with-stop pattern.
+        if mode is None:
+            if not isinstance(loop.get("stop_trigger_ref"), str) or not loop["stop_trigger_ref"].strip():
+                raise ValueError(f"{filename}: loop without mode must have a non-empty stop_trigger_ref")
+            return
         if mode not in {"manual_stop", "max_cycles", "stop_trigger"}:
             raise ValueError(f"{filename}: unsupported loop mode: {mode}")
         restart_step = loop.get("restart_step")
@@ -98,22 +122,26 @@ class WorkflowStore:
             if not isinstance(max_cycles, int) or isinstance(max_cycles, bool) or max_cycles < 1:
                 raise ValueError(f"{filename}: loop max_cycles must be an integer >= 1")
         if mode == "stop_trigger":
-            trigger = loop.get("stop_trigger")
-            if not isinstance(trigger, dict):
-                raise ValueError(f"{filename}: loop stop_trigger is required")
-            if trigger.get("type", "text") != "text":
-                raise ValueError(f"{filename}: stop_trigger supports only text type")
-            if trigger.get("event") not in {"appear", "disappear"}:
-                raise ValueError(f"{filename}: stop_trigger event must be appear/disappear")
-            if not isinstance(trigger.get("text"), str) or not trigger["text"].strip():
-                raise ValueError(f"{filename}: stop_trigger text must be non-empty")
-            region = trigger.get("region")
-            if not isinstance(region, dict) or any(
-                not isinstance(region.get(key), (int, float))
-                for key in ("x_ratio", "y_ratio", "width_ratio", "height_ratio")
-            ):
-                raise ValueError(f"{filename}: stop_trigger region must contain numeric ratios")
-            for key, minimum in (("poll_interval_ms", 1), ("confirm_frames", 1), ("cooldown_ms", 0)):
-                value = trigger.get(key, 500 if key == "poll_interval_ms" else (2 if key == "confirm_frames" else 0))
-                if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-                    raise ValueError(f"{filename}: stop_trigger {key} is invalid")
+            stop_ref = loop.get("stop_trigger_ref")
+            stop_trigger = loop.get("stop_trigger")
+            if not isinstance(stop_ref, str) and not isinstance(stop_trigger, dict):
+                raise ValueError(f"{filename}: stop_trigger mode requires stop_trigger_ref or stop_trigger")
+            if isinstance(stop_ref, str) and not stop_ref.strip():
+                raise ValueError(f"{filename}: loop stop_trigger_ref cannot be empty")
+            if isinstance(stop_trigger, dict):
+                if stop_trigger.get("type", "text") != "text":
+                    raise ValueError(f"{filename}: stop_trigger supports only text type")
+                if stop_trigger.get("event") not in {"appear", "disappear"}:
+                    raise ValueError(f"{filename}: stop_trigger event must be appear/disappear")
+                if not isinstance(stop_trigger.get("text"), str) or not stop_trigger["text"].strip():
+                    raise ValueError(f"{filename}: stop_trigger text must be non-empty")
+                region = stop_trigger.get("region")
+                if not isinstance(region, dict) or any(
+                    not isinstance(region.get(key), (int, float))
+                    for key in ("x_ratio", "y_ratio", "width_ratio", "height_ratio")
+                ):
+                    raise ValueError(f"{filename}: stop_trigger region must contain numeric ratios")
+                for key, minimum in (("poll_interval_ms", 1), ("confirm_frames", 1), ("cooldown_ms", 0)):
+                    value = stop_trigger.get(key, 500 if key == "poll_interval_ms" else (2 if key == "confirm_frames" else 0))
+                    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+                        raise ValueError(f"{filename}: stop_trigger {key} is invalid")

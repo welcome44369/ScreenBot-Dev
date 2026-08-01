@@ -150,8 +150,13 @@ def main():
         root = Path(temp_dir)
         (root / "triggers").mkdir()
         trigger_id = "trigger_money"
+        # Trigger must have `event` for validate_trigger compatibility, even when
+        # a canonical `condition` is also present (wizard saves both fields).
         (root / "triggers" / f"{trigger_id}.json").write_text(
-            '''{"id":"trigger_money","name":"Money stop","type":"text","text":"金錢不足","condition":{"mode":"edge","desired_state":"present"},"region":{"x_ratio":0,"y_ratio":0,"width_ratio":1,"height_ratio":1},"poll_interval_ms":500,"confirm_frames":2,"cooldown_ms":0,"min_absent_duration_ms":0}''',
+            '{"id":"trigger_money","name":"Money stop","type":"text","text":"金錢不足",'
+            '"event":"appear","condition":{"mode":"edge","desired_state":"present"},'
+            '"region":{"x_ratio":0,"y_ratio":0,"width_ratio":1,"height_ratio":1},'
+            '"poll_interval_ms":500,"confirm_frames":2,"cooldown_ms":0,"min_absent_duration_ms":0}',
             encoding="utf-8",
         )
         (root / "scripts").mkdir()
@@ -171,8 +176,7 @@ def main():
         assert resolved["loop"]["stop_trigger"]["id"] == trigger_id
         assert resolved["loop"]["stop_trigger"]["condition"] == {"mode": "edge", "desired_state": "present"}
 
-        # Global stop is independent from normal looping.  A loop object with
-        # only the canonical reference is an explicit one-shot workflow.
+        # A loop with only stop_trigger_ref (no mode) is a valid legacy one-shot pattern.
         one_shot = {
             "id": "workflow_one_shot_stop", "name": "One-shot stop", "steps": [
                 {"id": "step_1", "trigger_ref": trigger_id, "macro_ref": "macro"}
@@ -207,31 +211,42 @@ def main():
         from app.workflow_manager import WorkflowManager
         qt_app = QApplication.instance() or QApplication([])
         manager = WorkflowManager(store, trigger_store, ScriptStore(root))
-        for mode in (None, "manual_stop", "max_cycles"):
+        # stop_combo is only enabled in stop_trigger mode (per design spec).
+        for mode in ("manual_stop", "max_cycles"):
             manager.loop_combo.setCurrentIndex(manager.loop_combo.findData(mode))
-            assert manager.stop_combo.isEnabled()
-        manager.name_edit.setText("Manager one-shot stop")
+            assert not manager.stop_combo.isEnabled(), f"stop_combo should be disabled for mode={mode}"
+        manager.loop_combo.setCurrentIndex(manager.loop_combo.findData("stop_trigger"))
+        assert manager.stop_combo.isEnabled(), "stop_combo should be enabled for stop_trigger mode"
+        # Manager saves with stop_trigger mode and stop_trigger_ref.
+        manager.name_edit.setText("Manager stop test")
         manager.trigger_combo.setCurrentIndex(manager.trigger_combo.findData(trigger_id))
         manager.macro_combo.setCurrentIndex(manager.macro_combo.findData("macro"))
         manager.stop_combo.setCurrentIndex(manager.stop_combo.findData(trigger_id))
-        manager.loop_combo.setCurrentIndex(manager.loop_combo.findData(None))
+        manager.loop_combo.setCurrentIndex(manager.loop_combo.findData("stop_trigger"))
         manager._save()
-        manager_saved = next(item for item in store.list_workflows() if item["name"] == "Manager one-shot stop")
-        assert store.load_workflow(manager_saved["filename"])["loop"] == {"stop_trigger_ref": trigger_id}
+        manager_saved = next(item for item in store.list_workflows() if item["name"] == "Manager stop test")
+        saved_loop = store.load_workflow(manager_saved["filename"])["loop"]
+        assert saved_loop["mode"] == "stop_trigger"
+        assert saved_loop["stop_trigger_ref"] == trigger_id
+        # Switching to manual_stop disables stop_combo; saving omits stop_trigger_ref.
         manager.name_edit.setText("Manager manual no stop")
-        manager.stop_combo.setCurrentIndex(manager.stop_combo.findData(None))
         manager.loop_combo.setCurrentIndex(manager.loop_combo.findData("manual_stop"))
         manager._save()
         manager_cleared = next(item for item in store.list_workflows() if item["name"] == "Manager manual no stop")
         assert "stop_trigger_ref" not in store.load_workflow(manager_cleared["filename"])["loop"]
         manager.close()
+        # Editor: stop_group not visible on fresh open; loading one_shot draft shows it.
         editor = WorkflowEditor(store, ScriptStore(root), trigger_store=trigger_store)
-        assert not editor.stop_group.isVisible()
-        editor._draft = one_shot
+        assert editor.stop_group.isHidden()
+        # Load the one-shot draft (no mode, only stop_trigger_ref) — editor normalises
+        # it to stop_trigger mode and commits back with the ref.
+        editor._draft = dict(one_shot)
         editor._load_loop_settings()
+        assert editor.loop_mode_combo.currentData() == "stop_trigger"
+        assert not editor.stop_group.isHidden()
         editor._commit_loop_settings()
         assert editor._draft["loop"]["stop_trigger_ref"] == trigger_id
-        assert "mode" not in editor._draft["loop"]
+        assert editor._draft["loop"]["mode"] == "stop_trigger"
         editor.close()
         del qt_app
 
