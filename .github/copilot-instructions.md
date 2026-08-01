@@ -17,5 +17,14 @@
   force push, or push to `screenbot-readonly`.
 - After Workflow, Trigger, ScriptPlayer, start-handoff, or UI-collapse changes,
   run `python tools/run_dev_acceptance.py all-non-input`.
+- The actual `F:\ScreenBot` working copy is the authoritative UI/UX reference.
+  ScreenBot Dev remains the authoritative performance and execution-core
+  reference.
+- Restore UI behavior by adapting it to Dev services; never overwrite the Dev
+  window core.
+- Developer interactive acceptance is the primary product acceptance.
+- Autonomous tests are optional internal diagnostics and are not authoritative
+  product acceptance.
+- Do not resume Background Input Foundation until UI Recovery R0 is accepted.
 - Automated PASS is not Controlled Live Acceptance PASS. Stop and report if a
   task needs a protected-boundary change.

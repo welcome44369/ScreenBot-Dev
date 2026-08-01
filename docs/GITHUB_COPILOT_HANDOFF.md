@@ -11,6 +11,12 @@
 inspected, compared, and used to selectively port an individually approved
 feature. It must never receive a push or direct development.
 
+## Cross-agent handoff source
+
+- Canonical cross-agent handoff document: [CODEX_HANDOFF.md](./CODEX_HANDOFF.md)
+- This Copilot handoff remains for Copilot-specific runtime guidance and must
+  not contradict the Codex handoff baseline.
+
 ## Product direction and protected boundaries
 
 ScreenBot Dev is moving toward safe, foreground-guarded desktop automation:
@@ -52,7 +58,13 @@ running. F8 remains lock/unlock only and never starts a workflow.
 - A.1.5e implementation and autonomous tests: PASS
 - A.1.5e Controlled Live Acceptance: PENDING
 - Phase A.1.5: ACCEPTANCE INCOMPLETE
-- Background Input Foundation: NOT STARTED
+- Background Input Foundation B1a: PAUSED
+
+### R0 tracking note
+
+- `ui-core-r0a` todo ID was previously reused by mistake during the R0e-0a
+  rollback task. R0a Clean Shutdown true status remains determined by developer
+  interactive PASS evidence.
 
 ## Runtime and test policy
 
@@ -89,13 +101,34 @@ Use it only for explicitly authorized Controlled Live Acceptance.
 
 ## Next single task
 
-`Phase A.1.5e-LA — Controlled Live Acceptance for Start-Collapse`.
+`UI/Core Integration R0 — Clean Shutdown and Trigger UI Recovery`.
 
-The user performs exactly one F8 and one Start. Confirm one UI collapse, no
-ScreenBot interception, one delayed target click, no observer click, one
-terminal completion, and one UI restore. Do not repeat Start during the test.
+The task is to restore the original user experience for clean shutdown and
+trigger authoring without regressing the protected ScreenBot Dev execution core.
+Do not overwrite TargetSession, overlay ownership, Z-order/topmost/flashing
+safeguards, F8 semantics, the foreground input gate, or the start-collapse flow.
+
+The actual `F:\ScreenBot` working copy is the authoritative UI/UX reference.
+ScreenBot Dev remains the authoritative performance and execution-core
+reference. Restore UI behavior by adapting it to Dev services; never overwrite
+Dev's window core.
+
+Developer interactive acceptance is the primary product acceptance. Autonomous
+tests remain optional internal diagnostics and are not authoritative product
+acceptance. Do not resume Background Input Foundation until UI Recovery R0 is
+accepted.
+
+## High-priority known issue
+
+- OPEN: F8 currently remains lock/refresh only in Dev and cannot unlock an
+  existing TargetSession. The R0e-0a toggle fix was rolled back pending a
+  larger follow-up budget and developer interactive acceptance.
 
 ## Important commits
+
+- `eb82e73 feat(ui): allow workflow monitoring during collapsed execution`:
+  validated combined persistence of R0a Clean Shutdown and R0d-2 reversible
+  workflow monitoring.
 
 - `157d85b` — trigger payload boundary preservation
 - `fd4696c` — autonomous workflow test environment
