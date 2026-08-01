@@ -9,9 +9,9 @@ from pathlib import Path
 from datetime import datetime
 from shutil import which
 
-from PySide6.QtCore import QObject, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QTimer, Qt, QUrl, Signal, QPoint, QRect
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import QApplication, QMessageBox, QInputDialog
-from PySide6.QtGui import QCloseEvent, QDesktopServices
 
 from app.logging_setup import setup_logging
 from app.settings import Settings
@@ -235,6 +235,9 @@ class ScreenBotApp:
             self.logger.exception("Hotkey registration failed")
 
         self.set_state(AppState.IDLE)
+        # A saved compact position is user preference, never runtime state.
+        # Start with the full panel visible even after an abnormal termination.
+        self.widget.showNormal()
         self.widget.show()
         self.logger.info("ScreenBot 啟動")
 
@@ -279,9 +282,41 @@ class ScreenBotApp:
             self.widget.select_script(scripts[0][0])
             self.load_script(scripts[0][0])
 
+    @staticmethod
+    def _safe_startup_position(saved_position, widget_size, work_areas):
+        """Keep the compact UI materially visible on an available work area."""
+        try:
+            position = QPoint(int(saved_position[0]), int(saved_position[1]))
+        except (IndexError, TypeError, ValueError):
+            position = QPoint(120, 120)
+        size = widget_size
+        candidate = QRect(position, size)
+        areas = [QRect(area) for area in work_areas if area is not None]
+        if not areas:
+            return position
+        # Preserve a valid saved placement.  A sliver at a screen edge is not
+        # useful UI, so require at least 64px in each dimension to be visible.
+        for area in areas:
+            visible = candidate.intersected(area)
+            if visible.width() >= min(64, size.width()) and visible.height() >= min(64, size.height()):
+                return position
+        primary = areas[0]
+        margin = 24
+        max_x = primary.right() - size.width() + 1 - margin
+        max_y = primary.bottom() - size.height() + 1 - margin
+        return QPoint(
+            max(primary.left() + margin, min(position.x(), max_x)),
+            max(primary.top() + margin, min(position.y(), max_y)),
+        )
+
     def _restore_position(self):
         pos = self.settings.get("bubble_position", [120, 120])
-        self.widget.move(pos[0], pos[1])
+        screens = QGuiApplication.screens()
+        work_areas = [screen.availableGeometry() for screen in screens]
+        safe_position = self._safe_startup_position(pos, self.widget.size(), work_areas)
+        if list(pos) != [safe_position.x(), safe_position.y()]:
+            self.logger.warning("Saved ScreenBot UI position was not sufficiently visible; clamped to %s,%s", safe_position.x(), safe_position.y())
+        self.widget.move(safe_position)
 
     def set_state(self, state, countdown_text=None):
         self.state = state
