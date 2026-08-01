@@ -374,6 +374,13 @@ class ScreenBotApp:
 
     def _f8_stop_then_unlock(self):
         """Clear only after existing synchronous stop owners report idle."""
+        widget = getattr(self, "widget", None)
+        capture_presentation = getattr(
+            widget, "capture_control_presentation", None
+        )
+        presentation = (
+            capture_presentation() if callable(capture_presentation) else None
+        )
         workflow = getattr(self, "workflow_runner", None)
         if workflow is not None and workflow.is_active():
             stopper = getattr(self, "stop_workflow", None)
@@ -399,9 +406,48 @@ class ScreenBotApp:
         if target_session is None or not target_session.has_target():
             return False
         target_session.clear("f8_unlock")
-        self._refresh_compact_presentation()
+        self.refresh_ui_from_runtime_state(presentation=presentation)
         self.logger.info("F8_TARGET_UNLOCKED")
         return True
+
+    def refresh_ui_from_runtime_state(self, presentation=None):
+        """Render authoritative runtime state without inferring from labels."""
+        target_session = getattr(self, "target_session", None)
+        target_available = bool(
+            target_session is not None and target_session.has_target()
+        )
+        workflow = getattr(self, "workflow_runner", None)
+        workflow_running = bool(
+            workflow is not None and workflow.is_active()
+        )
+        widget = getattr(self, "widget", None)
+        workflow_setter = getattr(widget, "set_workflow_running", None)
+        if callable(workflow_setter):
+            workflow_setter(workflow_running)
+        if not target_available and not workflow_running:
+            self.workflow_ui_state = "IDLE"
+            runtime_setter = getattr(
+                widget, "set_workflow_runtime_info", None
+            )
+            if callable(runtime_setter):
+                runtime_setter(
+                    {
+                        "status": "IDLE",
+                        "workflow_name": None,
+                        "macro_running": False,
+                    }
+                )
+        restore_presentation = getattr(
+            widget, "restore_control_presentation", None
+        )
+        if callable(restore_presentation) and presentation is not None:
+            restore_presentation(presentation)
+        ensure_visible = getattr(
+            widget, "ensure_self_managed_visible", None
+        )
+        if callable(ensure_visible):
+            ensure_visible()
+        return self._refresh_compact_presentation()
 
     def lock_or_refresh_target_only(self):
         """Refresh the explicit target lock without changing runtime state."""
@@ -433,7 +479,7 @@ class ScreenBotApp:
             clear_memory = getattr(self.workflow_runner, "clear_condition_memory", None)
             if callable(clear_memory):
                 clear_memory()
-            self._refresh_compact_presentation()
+            self.refresh_ui_from_runtime_state()
             self.logger.info(
                 "Target locked/refreshed only: title=%s hwnd=%s client=%sx%s",
                 info.title,
@@ -449,7 +495,7 @@ class ScreenBotApp:
                 "TARGET_LOCK_FAILED", exception_type=type(exc).__name__, message=str(exc)
             )
             self.logger.warning("鎖定目標視窗失敗: %s", exc)
-            self._refresh_compact_presentation()
+            self.refresh_ui_from_runtime_state()
             self._show_message("無法鎖定目標視窗", str(exc))
             return None
 

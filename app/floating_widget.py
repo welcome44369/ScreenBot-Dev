@@ -623,6 +623,35 @@ class FloatingWidget(QWidget):
         self.workflow_running_stop_button.setEnabled(running)
         self._refresh_workflow_execution_controls()
 
+    def capture_control_presentation(self):
+        return {
+            "expanded": bool(self.expanded),
+            "runtime_debug_expanded": bool(self.runtime_debug_expanded),
+        }
+
+    def restore_control_presentation(self, presentation):
+        presentation = dict(presentation or {})
+        self._workflow_execution_active = False
+        self._workflow_execution_collapsed = False
+        self.expanded = bool(presentation.get("expanded", self.expanded))
+        self.runtime_debug_expanded = bool(
+            presentation.get("runtime_debug_expanded", False)
+        ) and self.expanded
+        self.details_widget.setVisible(self.expanded)
+        for item in self._runtime_debug_widgets:
+            item.setVisible(self.runtime_debug_expanded)
+        self.runtime_debug_toggle.setText(
+            "▼ Runtime Debug" if self.runtime_debug_expanded else "▶ Runtime Debug"
+        )
+        self.adjustSize()
+        self._refresh_workflow_execution_controls()
+
+    def ensure_self_managed_visible(self):
+        self.set_target_visibility_suppressed(False)
+        if self._ui_visibility_intent and not self.isVisible():
+            QWidget.show(self)
+            QTimer.singleShot(0, self._apply_native_no_activate)
+
     def set_ocr_process_probe_state(
         self, running=False, message=None, completed=False
     ):

@@ -554,7 +554,7 @@ class TargetRelativeOverlayTests(unittest.TestCase):
         )
         harness.target_session.publish("TARGET_DISCONNECTED", disconnected)
         self.assertIsNone(harness.coordinator._binding)
-        self.assertTrue(harness.widget.suppression[-1])
+        self.assertFalse(harness.widget.suppression[-1])
 
     def test_relock_changes_generation_and_stale_event_is_ignored(self):
         harness = CoordinatorHarness()

@@ -478,7 +478,11 @@ class TargetRelativeOverlayCoordinator(QObject):
         )
         if event in {"TARGET_SESSION_CLEARED", "TARGET_DISCONNECTED"}:
             if snapshot is None or self._is_current_binding(snapshot):
-                self.detach(hide=True)
+                # The compact ScreenBot controls are also the native window
+                # coordinated beside the target. Detaching the target must
+                # release target-driven suppression, not hide application UI.
+                self.detach(hide=False)
+                self._set_effective_visible(self._ui_wants_visible)
             return
         if snapshot is None:
             return
