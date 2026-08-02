@@ -45,6 +45,25 @@ def normalize_condition(condition=None, event=None):
     raise ValueError("Text trigger requires a valid condition or legacy event")
 
 
+def normalize_trigger_payload(payload, *, legacy_event_authoritative=False):
+    """Return a copy with one canonical ``condition`` representation.
+
+    Persisted inline workflows historically stored both the legacy UI
+    ``event`` and a derived ``condition``.  When the editor changed only the
+    event, the derived value became stale.  Callers that own those inline
+    legacy fields opt into event precedence; resource triggers keep their
+    explicit six-condition value authoritative.
+    """
+    result = dict(payload)
+    event = result.get("event")
+    condition = result.get("condition")
+    if legacy_event_authoritative and event in {"appear", "disappear"}:
+        condition = None
+    canonical, _legacy_mode = normalize_condition(condition, event)
+    result["condition"] = canonical
+    return result
+
+
 def ui_code_from_trigger(trigger):
     trigger = trigger if isinstance(trigger, dict) else {}
     code = condition_code(trigger.get("condition"))

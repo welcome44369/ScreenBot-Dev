@@ -375,8 +375,8 @@ class WorkflowDiagnostics:
                     self.add_event("Trigger", condition_event.get("event", "TRIGGER_CONDITION"), event=condition_event.get("event", "TRIGGER_CONDITION"), data=condition_event.get("data") or {})
                     self._last_logged_condition_event_key = key
             self.poll_count = max(self.poll_count, trigger_runtime.get("poll_count", 0))
-            self.trigger_count = max(self.trigger_count, trigger_runtime.get("trigger_fire_count", 0))
-            self.macro_count = max(self.macro_count, trigger_runtime.get("macro_start_count", 0))
+            self.trigger_count = int(snapshot.get("trigger_count", self.trigger_count) or 0)
+            self.macro_count = int(snapshot.get("macro_count", self.macro_count) or 0)
             self.last_ocr_result = trigger_runtime.get("last_ocr_text", "")
             self.last_ocr_success_time = trigger_runtime.get("last_ocr_success_time")
             self.consecutive_success = trigger_runtime.get("consecutive_success", 0)
@@ -386,9 +386,10 @@ class WorkflowDiagnostics:
 
             candidate_count = trigger_status.get("candidate_count", 0) or 0
             confirm_frames = trigger_status.get("confirm_frames", 1) or 1
+            candidate_count = min(candidate_count, confirm_frames)
             self.confirm_progress = f"{candidate_count} / {confirm_frames}"
             self.cooldown_remaining_ms = int(trigger_status.get("cooldown_remaining_ms", 0) or 0)
-            self.last_trigger_time = trigger_status.get("last_trigger_time")
+            self.last_trigger_time = snapshot.get("last_trigger_time")
             observation = trigger_status.get("observation") or {}
             observation_signature = (
                 observation.get("state"),
@@ -397,6 +398,13 @@ class WorkflowDiagnostics:
                 round(float(observation.get("readability_score", 0.0) or 0.0), 2),
                 round(float(observation.get("presence_score", 0.0) or 0.0), 2),
                 observation.get("reason"),
+                observation.get("template_available"),
+                round(float(observation.get("template_score", 0.0) or 0.0), 2),
+                observation.get("visual_classification"),
+                observation.get("fused_classification"),
+                observation.get("burst_id"),
+                observation.get("roi_valid"),
+                observation.get("roi_revision"),
             )
             if observation and observation_signature != self._last_logged_observation_signature:
                 self.add_event(
@@ -427,7 +435,7 @@ class WorkflowDiagnostics:
                 self.add_event("OCR", f"Detected = {detected_text}")
                 self._last_logged_ocr = self.last_ocr_result
 
-            trigger_fire_count = trigger_runtime.get("trigger_fire_count", 0)
+            trigger_fire_count = self.trigger_count
             if trigger_fire_count > self._last_trigger_count:
                 self.add_event("Trigger", "Trigger Fired", event="TRIGGER_FIRED", force_flush=True)
             self._last_trigger_count = max(self._last_trigger_count, trigger_fire_count)

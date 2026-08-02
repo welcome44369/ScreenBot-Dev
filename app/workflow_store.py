@@ -1,7 +1,10 @@
 import json
 import logging
+from copy import deepcopy
 from pathlib import Path
 from uuid import uuid4
+
+from app.trigger_conditions import normalize_trigger_payload
 
 
 class WorkflowStore:
@@ -28,6 +31,7 @@ class WorkflowStore:
             raise FileNotFoundError(path)
         data = self._load_json(path)
         data = self._migrate_legacy_loop(data)
+        data = self._normalize_inline_trigger_conditions(data)
         self._validate_workflow(data, filename)
         return data
 
@@ -54,7 +58,7 @@ class WorkflowStore:
 
     def save_workflow(self, data, filename=None):
         """Write workflow data to workflows/filename (creates or overwrites the file)."""
-        data = self._ensure_id(data)
+        data = self._normalize_inline_trigger_conditions(self._ensure_id(data))
         filename = filename or f"{data['id']}.json"
         self._validate_workflow(data, filename)
         path = self.workflows_dir / filename
@@ -63,6 +67,32 @@ class WorkflowStore:
             _json.dump(data, fh, indent=2, ensure_ascii=False)
         self.logger.info("Workflow saved: %s", filename)
         return filename
+
+    @staticmethod
+    def _normalize_inline_trigger_conditions(data):
+        """Upgrade legacy embedded trigger events in memory.
+
+        Trigger references are deliberately untouched: their explicit
+        six-condition contract belongs to TriggerStore.
+        """
+        result = deepcopy(data)
+        for step in result.get("steps", []):
+            trigger = step.get("trigger")
+            if isinstance(trigger, dict) and trigger.get("type", "text") == "text":
+                step["trigger"] = normalize_trigger_payload(
+                    trigger, legacy_event_authoritative=True
+                )
+        loop = result.get("loop")
+        if isinstance(loop, dict):
+            stop_trigger = loop.get("stop_trigger")
+            if (
+                isinstance(stop_trigger, dict)
+                and stop_trigger.get("type", "text") == "text"
+            ):
+                loop["stop_trigger"] = normalize_trigger_payload(
+                    stop_trigger, legacy_event_authoritative=True
+                )
+        return result
 
     def _ensure_id(self, data):
         result = dict(data)
@@ -131,8 +161,7 @@ class WorkflowStore:
             if isinstance(stop_trigger, dict):
                 if stop_trigger.get("type", "text") != "text":
                     raise ValueError(f"{filename}: stop_trigger supports only text type")
-                if stop_trigger.get("event") not in {"appear", "disappear"}:
-                    raise ValueError(f"{filename}: stop_trigger event must be appear/disappear")
+                normalize_trigger_payload(stop_trigger)
                 if not isinstance(stop_trigger.get("text"), str) or not stop_trigger["text"].strip():
                     raise ValueError(f"{filename}: stop_trigger text must be non-empty")
                 region = stop_trigger.get("region")

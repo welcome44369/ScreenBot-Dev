@@ -11,7 +11,11 @@ from uuid import uuid4
 
 from app.text_trigger import TextTrigger
 from app.trigger_runner import TriggerRunner
-from app.trigger_conditions import label_for_code, normalize_condition, ui_code_from_trigger
+from app.trigger_conditions import (
+    label_for_code,
+    normalize_trigger_payload,
+    ui_code_from_trigger,
+)
 from app.player import PlaybackStatus
 
 
@@ -93,6 +97,12 @@ class WorkflowRunner:
         self._stop_macro_cancel_requested = False
         self._condition_memory = {}
         self._runtime_run_id = None
+        self._workflow_trigger_count = 0
+        self._workflow_macro_count = 0
+        self._workflow_last_trigger_time = None
+        self._counted_trigger_generation = None
+        self._counted_generation_trigger_count = 0
+        self._counted_generation_macro_count = 0
 
     def load_workflow(self, workflow_data):
         self.stop(manual=False)
@@ -135,6 +145,7 @@ class WorkflowRunner:
         self._stop_macro_cancel_requested = False
         self._condition_memory.clear()
         self._runtime_run_id = f"workflow-run-{uuid4().hex}"
+        self._reset_runtime_counters()
         return self.workflow
 
     def load_workflow_file(self, file_path):
@@ -173,6 +184,7 @@ class WorkflowRunner:
         # Every explicit Start begins a new condition session; cycle restarts
         # deliberately share this dictionary.
         self._condition_memory.clear()
+        self._reset_runtime_counters()
         self.current_cycle = self.completed_cycles + 1
         if self.stop_trigger_enabled:
             cfg = self.stop_trigger_config
@@ -707,6 +719,7 @@ class WorkflowRunner:
         trigger = dict(step["trigger"])
         trigger.setdefault("type", "text")
         if trigger.get("type") == "text":
+            trigger = normalize_trigger_payload(trigger)
             trigger.setdefault("region", {"x_ratio": 0.0, "y_ratio": 0.0, "width_ratio": 1.0, "height_ratio": 1.0})
             trigger.setdefault("poll_interval_ms", 500)
             trigger.setdefault("confirm_frames", 2)
@@ -725,10 +738,48 @@ class WorkflowRunner:
         ):
             return
         with self._status_lock:
+            if generation != self._counted_trigger_generation:
+                self._counted_trigger_generation = generation
+                self._counted_generation_trigger_count = 0
+                self._counted_generation_macro_count = 0
+            trigger_count = int(status.get("trigger_fire_count", 0) or 0)
+            macro_count = int(status.get("macro_start_count", 0) or 0)
+            if trigger_count > self._counted_generation_trigger_count:
+                self._workflow_trigger_count += (
+                    trigger_count - self._counted_generation_trigger_count
+                )
+            if macro_count > self._counted_generation_macro_count:
+                self._workflow_macro_count += (
+                    macro_count - self._counted_generation_macro_count
+                )
+            self._counted_generation_trigger_count = max(
+                self._counted_generation_trigger_count, trigger_count
+            )
+            self._counted_generation_macro_count = max(
+                self._counted_generation_macro_count, macro_count
+            )
+            last_trigger_time = (
+                status.get("trigger_status") or {}
+            ).get("last_trigger_time")
+            if last_trigger_time is not None:
+                self._workflow_last_trigger_time = last_trigger_time
             self._latest_trigger_status = status
+
+    def _reset_runtime_counters(self):
+        with self._status_lock:
+            self._workflow_trigger_count = 0
+            self._workflow_macro_count = 0
+            self._workflow_last_trigger_time = None
+            self._counted_trigger_generation = None
+            self._counted_generation_trigger_count = 0
+            self._counted_generation_macro_count = 0
 
     def _stop_trigger_snapshot(self):
         trigger_status = self._stop_text_trigger.get_status_snapshot() if self._stop_text_trigger else {}
+        candidate_count = int(trigger_status.get("candidate_count", 0) or 0)
+        confirm_frames = int(trigger_status.get("confirm_frames", 0) or 0)
+        if confirm_frames:
+            candidate_count = min(candidate_count, confirm_frames)
         return {
             "enabled": self.stop_trigger_enabled,
             "trigger_text": self.stop_trigger_config.get("text") if self.stop_trigger_config else None,
@@ -749,7 +800,7 @@ class WorkflowRunner:
             "stop_source": self.stop_source,
             "macro_cancel_requested": self._stop_macro_cancel_requested,
             "confirm_progress": (
-                f"{trigger_status.get('candidate_count', 0)} / {trigger_status.get('confirm_frames', 0)}"
+                f"{candidate_count} / {confirm_frames}"
                 if trigger_status
                 else "N/A"
             ),
@@ -786,6 +837,9 @@ class WorkflowRunner:
             "trigger_event": trigger.get("event"),
             "macro": step.get("macro"),
             "trigger_runtime": trigger_status,
+            "trigger_count": self._workflow_trigger_count,
+            "macro_count": self._workflow_macro_count,
+            "last_trigger_time": self._workflow_last_trigger_time,
             "playback_status": getattr(getattr(player_result, "status", None), "value", None),
             "loop_mode": loop_mode,
             "restart_step": self.restart_step,
@@ -912,7 +966,7 @@ class WorkflowRunner:
             if trigger_type not in {"text", "workflow_start"}:
                 raise ValueError(f"Workflow step {step_id} has unsupported trigger type")
             if trigger_type == "text":
-                normalize_condition(trigger.get("condition"), trigger.get("event"))
+                trigger = normalize_trigger_payload(trigger)
                 if not isinstance(trigger.get("text"), str) or not trigger["text"]:
                     raise ValueError(f"Workflow step {step_id} requires non-empty trigger text")
                 region = trigger.get("region")
@@ -975,7 +1029,7 @@ class WorkflowRunner:
                 raise ValueError("loop.stop_trigger must be an object")
             if stop_trigger.get("type", "text") != "text":
                 raise ValueError("loop.stop_trigger supports only text type")
-            normalize_condition(stop_trigger.get("condition"), stop_trigger.get("event"))
+            stop_trigger = normalize_trigger_payload(stop_trigger)
             if not isinstance(stop_trigger.get("text"), str) or not stop_trigger.get("text"):
                 raise ValueError("loop.stop_trigger.text must be non-empty")
             region = stop_trigger.get("region")
@@ -1001,7 +1055,8 @@ class WorkflowRunner:
                 **({"id": stop_trigger["id"]} if stop_trigger.get("id") else {}),
                 **({"name": stop_trigger["name"]} if stop_trigger.get("name") else {}),
                 "type": "text",
-                **({"condition": dict(stop_trigger["condition"])} if stop_trigger.get("condition") else {"event": stop_trigger["event"]}),
+                "condition": dict(stop_trigger["condition"]),
+                **({"event": stop_trigger["event"]} if stop_trigger.get("event") else {}),
                 "text": stop_trigger["text"],
                 "region": dict(region),
                 "poll_interval_ms": poll_interval,

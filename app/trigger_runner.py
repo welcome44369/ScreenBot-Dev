@@ -6,7 +6,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from app.text_trigger import TextTrigger
-from app.trigger_conditions import normalize_condition
+from app.trigger_conditions import normalize_trigger_payload
 
 
 class TriggerRunner:
@@ -567,7 +567,9 @@ class TriggerRunner:
             return trigger_data
         if trigger_type != "text":
             raise ValueError("Only text and workflow_start triggers are supported")
-        normalize_condition(trigger.get("condition"), trigger.get("event"))
+        trigger = normalize_trigger_payload(trigger)
+        trigger_data = dict(trigger_data)
+        trigger_data["trigger"] = trigger
         if not isinstance(trigger.get("text"), str) or not trigger["text"]:
             raise ValueError("Trigger text must be non-empty")
         region = trigger.get("region")

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from app.ocr_region_selector import OCRRegionSelectorDialog, pil_image_to_qpixmap
 from app.ocr_preview_worker import OCRPreviewWorker
+from app.trigger_conditions import normalize_trigger_payload
 
 VALID_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 SUPPORTED_TRIGGER_TYPES = {"text"}
@@ -630,6 +631,11 @@ class WorkflowEditor(QWidget):
         trigger["confirm_frames"]      = self.fld_confirm.value()
         trigger["cooldown_ms"]         = self.fld_cooldown.value()
         trigger["region"]              = self._normalize_region(self._current_region)
+        normalized_trigger = normalize_trigger_payload(
+            trigger, legacy_event_authoritative=True
+        )
+        trigger.clear()
+        trigger.update(normalized_trigger)
         macro_file = self.fld_macro.currentData()
         step["macro"] = macro_file or None
 

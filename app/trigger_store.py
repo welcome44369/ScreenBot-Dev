@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from app.trigger_conditions import normalize_trigger_payload
+
 
 DEFAULT_REGION = {"x_ratio": 0.0, "y_ratio": 0.0, "width_ratio": 1.0, "height_ratio": 1.0}
 
@@ -151,6 +153,7 @@ class TriggerStore:
         if normalized_region["y_ratio"] + normalized_region["height_ratio"] > 1:
             raise ValueError("Trigger region y + height must be <= 1")
         result = dict(data)
+        result = normalize_trigger_payload(result)
         result["version"] = int(data.get("version", 1))
         result["type"] = "text"
         result["texts"] = list(dict.fromkeys(text.strip() for text in texts))

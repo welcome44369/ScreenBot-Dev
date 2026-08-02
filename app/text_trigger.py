@@ -682,7 +682,14 @@ class TextTrigger:
                 "disappear_confirmed"
             )
             return self._match(
-                now, previous, "bounded_disappear_confirmation", latch=True
+                now,
+                previous,
+                (
+                    "replacement_state_confirmed"
+                    if replacement_fast_path
+                    else "edge_absent_confirmed"
+                ),
+                latch=True,
             )
         return self._result(False, None, previous != self.state)
 
@@ -1145,7 +1152,7 @@ class TextTrigger:
             "candidate_count": (
                 min(5, len(self._disappear_evidence))
                 if burst_active
-                else self._pending_count or 0
+                else min(self.confirm_frames, self._pending_count or 0)
             ),
             "confirm_frames": 5 if burst_active else self.confirm_frames,
             "last_present": observation.state == "PRESENT" if observation else None,

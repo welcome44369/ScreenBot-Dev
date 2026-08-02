@@ -1,6 +1,8 @@
 """Resolve resource references into the legacy WorkflowRunner schema."""
 from copy import deepcopy
 
+from app.trigger_conditions import normalize_trigger_payload
+
 
 class WorkflowResolver:
     def __init__(self, trigger_store, macro_store):
@@ -34,9 +36,13 @@ class WorkflowResolver:
                     )
                     if key in trigger
                 }
-                step["trigger"] = resolved_trigger
+                step["trigger"] = normalize_trigger_payload(resolved_trigger)
             elif not isinstance(step.get("trigger"), dict):
                 raise ValueError(f"Step {step.get('id', '(unknown)')} is missing trigger or trigger_ref")
+            elif step["trigger"].get("type", "text") == "text":
+                step["trigger"] = normalize_trigger_payload(
+                    step["trigger"], legacy_event_authoritative=True
+                )
             if step.get("macro_ref"):
                 macro_id = step["macro_ref"]
                 filename = macro_id if str(macro_id).endswith(".json") else f"{macro_id}.json"
@@ -48,7 +54,7 @@ class WorkflowResolver:
         loop = resolved.get("loop")
         if isinstance(loop, dict) and loop.get("stop_trigger_ref"):
             trigger = self.trigger_store.load_trigger(loop["stop_trigger_ref"])
-            loop["stop_trigger"] = {
+            loop["stop_trigger"] = normalize_trigger_payload({
                 key: trigger[key]
                 for key in (
                     "id",
@@ -66,5 +72,13 @@ class WorkflowResolver:
                     "observation",
                 )
                 if key in trigger
-            }
+            })
+        elif (
+            isinstance(loop, dict)
+            and isinstance(loop.get("stop_trigger"), dict)
+            and loop["stop_trigger"].get("type", "text") == "text"
+        ):
+            loop["stop_trigger"] = normalize_trigger_payload(
+                loop["stop_trigger"], legacy_event_authoritative=True
+            )
         return resolved
